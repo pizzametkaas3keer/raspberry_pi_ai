@@ -24,10 +24,6 @@ Preferably use Python 3.11 on Windows.
 `source .venv/bin/activate`
 `python pi_test_3d.py`
 
-**Controls:**
-- `SPACE` = Change emotion
-- `ESC` = Exit
-
 ## Start Pi server
 `source .venv/bin/activate`
 `python pi_app.py --host 0.0.0.0 --port 8765 --model phi3:mini`
@@ -64,3 +60,6 @@ The Pi app can now perform simple actions. For security, this operates primarily
 - set volume to 50 percent
 - what is the pi status
 - what is the ip address
+
+**one last thing:**
+- you could run this probably on any device that is linux or windows
