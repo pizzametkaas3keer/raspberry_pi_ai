@@ -1,83 +1,66 @@
-# Raspberry Pi 5 Voice Bot (2 apps + golf visual)
+# Raspberry Pi 5 Voice Bot (2 apps + wave visual)
 
-Wat dit project nu doet:
-- Pi app: Ollama bot + fullscreen energy-core visual die reageert op de AI-stem.
-- Laptop app: gebruikt de microfoon en speakers van het verbonden apparaat, doet Whisper transcriptie, stuurt tekst naar de Pi en speelt het antwoord af.
-- Tijdens het uitspreken van het antwoord stuurt de laptop live golf-info terug naar de Pi, zodat het scherm meebeweegt met de stem van de AI.
-- Testfile op Pi: `pi_test_3d.py` bevat de losse shader-test waarop de live visual is gebaseerd.
+### Current project functionality:
+- **Pi app:** Ollama bot + fullscreen energy-core visual that reacts to the AI voice.
+- **Laptop app:** Uses the connected device's microphone and speakers, handles Whisper transcription, sends text to the Pi, and plays the response.
+- **Live Sync:** While speaking the response, the laptop sends live wave information back to the Pi, so the screen moves in sync with the AI's voice.
+- **Test file on Pi:** `pi_test_3d.py` contains the standalone shader test that the live visual is based on.
 
-## Installeren
+## Installation
 
 ### Raspberry Pi
-```bash
-bash install.sh pi
-source .venv/bin/activate
-```
+`bash install.sh pi`
+`source .venv/bin/activate`
 
 ### Laptop
-Gebruik bij voorkeur Python 3.11 op Windows.
-```powershell
-py -3.11 -m venv .venv311
-.\.venv311\Scripts\activate
-python -m pip install --upgrade pip
-pip install faster-whisper websockets sounddevice pyttsx3 numpy
-```
+Preferably use Python 3.11 on Windows.
+`py -3.11 -m venv .venv311`
+`.\.venv311\Scripts\activate`
+`python -m pip install --upgrade pip`
+`pip install faster-whisper websockets sounddevice pyttsx3 numpy`
+(If available in the `laptop_setup.bat` script)
 
-## Visual testen op Pi
-```bash
-source .venv/bin/activate
-python pi_test_3d.py
-```
+## Testing the visual on Pi
+`source .venv/bin/activate`
+`python pi_test_3d.py`
 
-Bediening:
-- `SPATIE` = emotie wisselen
-- `ESC` = afsluiten
+**Controls:**
+- `SPACE` = Change emotion
+- `ESC` = Exit
 
-## Pi server starten
-```bash
-source .venv/bin/activate
-python pi_app.py --host 0.0.0.0 --port 8765 --model phi3:mini
-```
+## Start Pi server
+`source .venv/bin/activate`
+`python pi_app.py --host 0.0.0.0 --port 8765 --model phi3:mini`
 
-## Laptop client starten
-```powershell
-python -u .\laptop_app.py --host 192.168.1.73 --port 8765 --ollama-model phi3:mini --whisper-model base
-```
+## Start Laptop client
+`python -u .\laptop_app.py --host 192.168.1.73 --port 8765 --ollama-model phi3:mini --whisper-model base`
 
-Live luisteren zoals in `test.py`:
-```powershell
-python -u .\laptop_app.py --host 192.168.1.73 --port 8765 --ollama-model phi3:mini --whisper-model base --mode live
-```
+**Live listening as in `test.py`:**
+`python -u .\laptop_app.py --host 192.168.1.73 --port 8765 --ollama-model phi3:mini --whisper-model base --mode live`
 
-Live luisteren met wake word:
-```powershell
-python -u .\laptop_app.py --host 192.168.1.73 --port 8765 --ollama-model phi3:mini --whisper-model base --mode live --wake-word hey
-```
+**Live listening with wake word:**
+`python -u .\laptop_app.py --host 192.168.1.73 --port 8765 --ollama-model phi3:mini --whisper-model base --mode live --wake-word hey`
 
-Optioneel kun je een andere microfoon kiezen:
-```powershell
-python -u .\laptop_app.py --host 192.168.1.73 --input-device 1
-```
+**Optional: select a different microphone:**
+`python -u .\laptop_app.py --host 192.168.1.73 --input-device 1`
 
-## Emoties aanpassen
+## Customizing Emotions
 In `pi_app.py`:
-- `EMOTION_KEYWORDS` bepaalt welke woorden naar welke emotie gaan.
-- `EMOTION_LEVELS` bepaalt hoe sterk de golf beweegt per emotie.
-- `EMOTION_COLORS` bepaalt de kleur per emotie.
+- `EMOTION_KEYWORDS` determines which words map to which emotion.
+- `EMOTION_LEVELS` determines the intensity of the wave movement per emotion.
+- `EMOTION_COLORS` determines the color per emotion.
 
-## Pi tools via de AI
-De Pi-app kan nu ook simpele acties uitvoeren. Voor veiligheid werkt dit vooral binnen je home-map en projectmap.
+## Pi tools via AI
+The Pi app can now perform simple actions. For security, this operates primarily within your home directory and project folder.
 
-Voorbeelden:
-```text
-maak een map test
-lijst map test
-maak bestand notitie.txt met tekst "hallo"
-lees bestand notitie.txt
-verwijder bestand notitie.txt
-zoek online raspberry pi 5 temperatuur
-wat is de cpu temperatuur
-zet volume naar 50 procent
-wat is de pi status
-wat is het ip adres
-```
+**Examples:**
+- create folder test
+- list folder test
+- create file note.txt with text "hello"
+- read file note.txt
+- delete file note.txt
+- search online raspberry pi 5 temperature
+- what is the cpu temperature
+- set volume to 50 percent
+- what is the pi status
+- what is the ip address
