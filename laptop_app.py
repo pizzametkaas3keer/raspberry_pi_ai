@@ -99,7 +99,7 @@ def cleanup_models():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # 🌐 CLIENT INSTELLINGEN
-DEFAULT_HOST = "192.168.2.73"        # Default server host
+DEFAULT_HOST = "192.x.x.x"        # Default server host
 DEFAULT_PORT = 8765              # Default server poort
 DEFAULT_MODEL = "phi3:mini"     # Default AI model
 DEFAULT_WHISPER_MODEL = "base"  # Default speech recognition model
