@@ -1,0 +1,1025 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<title>Android GUI Builder</title>
+<style>
+  :root{
+    --bg:#1e1f26;
+    --panel:#262830;
+    --panel2:#2e3039;
+    --accent:#5ec8a8;
+    --accent2:#8a7ff0;
+    --text:#e7e8ec;
+    --muted:#9a9ca6;
+    --border:#3a3c47;
+    --canvas-bg:#fafafa;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    font-family:'Segoe UI',Roboto,Arial,sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    height:100vh;
+    overflow:hidden;
+  }
+  .app{
+    display:grid;
+    grid-template-columns:220px 1fr 290px;
+    height:100vh;
+  }
+  /* TOP BAR */
+  .topbar{
+    grid-column:1/4;
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:10px 16px;
+    background:var(--panel2);
+    border-bottom:1px solid var(--border);
+  }
+  .topbar h1{ font-size:15px; font-weight:600; margin:0; margin-right:auto; letter-spacing:.3px; }
+  .topbar h1 span{color:var(--accent);}
+  button.tb{
+    background:var(--panel); color:var(--text); border:1px solid var(--border);
+    padding:7px 12px; border-radius:6px; font-size:12.5px; cursor:pointer; transition:.15s;
+  }
+  button.tb:hover{background:#383b46;border-color:var(--accent);}
+  button.tb.primary{background:var(--accent);color:#15201c;border-color:var(--accent);font-weight:600;}
+  button.tb.primary:hover{background:#6fd6b6;}
+  button.tb.sm{padding:5px 9px;font-size:11.5px;}
+  button.tb.active{background:var(--accent2);border-color:var(--accent2);color:#fff;}
+
+  /* LAYOUT COLUMNS */
+  .palette,.props{ background:var(--panel); padding:14px; overflow-y:auto; border-right:1px solid var(--border); }
+  .props{border-right:none;border-left:1px solid var(--border);}
+  .section-title{ font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:18px 0 8px; }
+  .section-title:first-child{margin-top:0;}
+
+  .palette-item{
+    display:flex; align-items:center; gap:8px; padding:9px 10px; margin-bottom:6px;
+    background:var(--panel2); border:1px solid var(--border); border-radius:7px;
+    cursor:grab; font-size:13px; user-select:none;
+  }
+  .palette-item:hover{border-color:var(--accent);}
+
+  .canvas-wrap{
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:12px; background:#14151a; overflow:auto; position:relative; padding:20px;
+  }
+  .canvas-toolbar{ width:360px; display:flex; flex-direction:column; gap:8px; }
+  .tabs-row{ display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .tabs-bar{ display:flex; gap:6px; flex-wrap:wrap; }
+  .tab-chip{
+    background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:6px 10px;
+    font-size:12px; cursor:pointer; display:flex; align-items:center; gap:6px; color:var(--muted);
+  }
+  .tab-chip.active{border-color:var(--accent);color:var(--accent);background:rgba(94,200,168,.1);}
+  .tab-chip .ov-badge{font-size:9px;background:var(--accent2);color:#fff;padding:1px 5px;border-radius:4px;}
+  .tab-chip .del{opacity:.5;margin-left:2px;}
+  .tab-chip .del:hover{opacity:1;color:#ff8b8b;}
+  .tabs-add{display:flex;gap:6px;}
+
+  .phone{
+    width:360px; height:640px; background:var(--canvas-bg); border-radius:22px;
+    box-shadow:0 0 0 8px #0c0c10, 0 20px 50px rgba(0,0,0,.5); position:relative; overflow:hidden;
+  }
+  .statusbar{height:24px;background:#1565c0;width:100%;}
+  .stage{ position:absolute; top:24px; left:0; right:0; bottom:0; overflow:hidden; background:var(--canvas-bg); }
+  .stage.dragover{outline:2px dashed var(--accent); outline-offset:-2px;}
+  .preview-banner{
+    position:absolute; top:8px; left:50%; transform:translateX(-50%);
+    background:rgba(94,200,168,.95); color:#15201c; font-size:11px; font-weight:700;
+    padding:4px 10px; border-radius:20px; z-index:60; letter-spacing:.03em; pointer-events:none;
+  }
+
+  .layer{position:absolute;inset:0;}
+  .screen-layer{background:var(--canvas-bg);}
+  .overlay-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:30;}
+  .overlay-card{position:relative;overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.35);transition:transform .25s ease;}
+  .layer{transition:transform .25s ease;}
+
+  .widget{
+    position:absolute; cursor:move; box-sizing:border-box; display:flex; align-items:center;
+    justify-content:center; user-select:none; font-family:Roboto,Arial,sans-serif;
+    white-space:nowrap; overflow:hidden;
+  }
+  .widget.selected{outline:2px solid var(--accent2); outline-offset:1px;}
+  .resize-handle{
+    position:absolute; width:12px; height:12px; right:-6px; bottom:-6px;
+    background:var(--accent2); border:2px solid #fff; border-radius:3px; cursor:nwse-resize; display:none;
+  }
+  .widget.selected .resize-handle{display:block;}
+
+  .w-button{background:#6200ee;color:#fff;border-radius:4px;text-transform:uppercase;font-weight:500;font-size:13px;box-shadow:0 1px 3px rgba(0,0,0,.3);}
+  .w-textview{color:#212121;justify-content:flex-start;font-size:14px;background:transparent;}
+  .w-edittext{background:#fff;border-bottom:2px solid #6200ee;justify-content:flex-start;color:#888;font-size:13px;padding-left:4px;}
+  .w-imageview{background:repeating-conic-gradient(#d0d0d0 0% 25%, #e8e8e8 0% 50%) 0/16px 16px;color:#999;font-size:11px;}
+  .w-switch{justify-content:flex-start;color:#212121;font-size:13px;gap:6px;}
+  .w-switch .track{width:34px;height:16px;background:#6200ee;border-radius:10px;position:relative;flex:none;}
+  .w-switch .thumb{width:18px;height:18px;background:#fff;border-radius:50%;position:absolute;right:0;top:-1px;box-shadow:0 1px 2px rgba(0,0,0,.4);}
+  .w-checkbox{justify-content:flex-start;color:#212121;font-size:13px;gap:6px;}
+  .w-checkbox .box{width:16px;height:16px;border:2px solid #6200ee;border-radius:3px;flex:none;background:#6200ee;}
+  .w-progressbar{background:#e0e0e0;border-radius:3px;}
+  .w-progressbar::after{content:'';display:block;height:100%;width:60%;background:#6200ee;border-radius:3px;}
+  .w-seekbar .seek-track{width:100%;height:4px;background:#bdbdbd;border-radius:2px;position:relative;}
+  .w-seekbar .seek-thumb{width:14px;height:14px;border-radius:50%;background:#6200ee;position:absolute;left:40%;top:-5px;}
+  .widget.clickable-hint{cursor:pointer;}
+
+  /* fake keyboard */
+  .kb-overlay{
+    position:absolute; left:0; right:0; bottom:0; height:210px; background:#26282e;
+    z-index:80; display:flex; flex-direction:column; box-shadow:0 -4px 14px rgba(0,0,0,.4);
+  }
+  .kb-overlay .kb-head{
+    display:flex; justify-content:space-between; align-items:center; padding:7px 10px;
+    font-size:10.5px; color:#9a9ca6; border-bottom:1px solid #34363f; cursor:pointer;
+  }
+  .kb-overlay .kb-head:hover{color:#fff;}
+  .kb-overlay .kb-keys{flex:1;display:flex;flex-direction:column;gap:5px;padding:8px;}
+  .kb-overlay .kb-row{display:flex;gap:4px;flex:1;}
+  .kb-overlay .kb-key{flex:1;background:#37393f;border-radius:4px;}
+
+  /* PROPS PANEL */
+  .props label{display:block;font-size:11px;color:var(--muted);margin:10px 0 4px;}
+  .props input[type=text],.props input[type=number],.props select{
+    width:100%; background:var(--panel2); border:1px solid var(--border); color:var(--text);
+    padding:6px 8px; border-radius:5px; font-size:13px;
+  }
+  .props input[type=color]{width:100%;height:30px;border:1px solid var(--border);border-radius:5px;background:var(--panel2);padding:2px;}
+  .props .row2{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+  .props .checkrow{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--text);margin-top:10px;cursor:pointer;}
+  .empty-hint{color:var(--muted);font-size:12.5px;line-height:1.5;}
+  .props-box{border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-top:14px;background:var(--panel2);}
+  .props-box .section-title{margin-top:0;}
+
+  .layers{margin-top:6px;}
+  .layer-item{display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-radius:5px;font-size:12.5px;cursor:pointer;color:var(--muted);}
+  .layer-item:hover{background:var(--panel2);color:var(--text);}
+  .layer-item.active{background:rgba(94,200,168,.15);color:var(--accent);}
+  .layer-item .del{cursor:pointer;opacity:.6;}
+  .layer-item .del:hover{opacity:1;color:#ff8b8b;}
+
+  /* MODAL */
+  .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:100;}
+  .modal-overlay.open{display:flex;}
+  .modal{background:var(--panel);border:1px solid var(--border);border-radius:10px;width:700px;max-height:84vh;display:flex;flex-direction:column;}
+  .modal-head{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;}
+  .modal-head h2{font-size:14px;margin:0;}
+  .modal-head .x{cursor:pointer;color:var(--muted);font-size:18px;}
+  .modal-body{overflow-y:auto;padding:16px 18px;flex:1;}
+  .modal-body h4{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin:18px 0 8px;}
+  .modal-body h4:first-child{margin-top:0;}
+  .modal-body .hint{color:var(--muted);font-size:12px;margin:-4px 0 8px;}
+  .modal-body pre{margin:0;padding:14px 16px;overflow:auto;font-size:12px;line-height:1.5;color:#c9e8d4;background:#16171d;border-radius:7px;max-height:260px;}
+  .modal-body .blk-actions{display:flex;gap:8px;margin:8px 0 6px;}
+  .modal-foot{padding:10px 18px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;}
+  select.export-select{width:100%;margin-bottom:6px;}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <div class="topbar">
+    <h1>Android <span>GUI Builder</span></h1>
+    <button class="tb" id="btnPreview">▶ Voorbeeld</button>
+    <button class="tb" id="btnClear">Alles wissen</button>
+    <button class="tb" id="btnSaveJson">Project opslaan</button>
+    <button class="tb" id="btnLoadJson">Project laden</button>
+    <input type="file" id="fileLoad" accept=".json" style="display:none">
+    <button class="tb primary" id="btnExport">Exporteer naar code</button>
+  </div>
+
+  <div class="palette">
+    <div class="section-title">Componenten — sleep naar het scherm</div>
+    <div class="palette-item" draggable="true" data-type="button">🔲 Button</div>
+    <div class="palette-item" draggable="true" data-type="textview">🔤 TextView</div>
+    <div class="palette-item" draggable="true" data-type="edittext">✏️ EditText</div>
+    <div class="palette-item" draggable="true" data-type="imageview">🖼️ ImageView</div>
+    <div class="palette-item" draggable="true" data-type="switch">🔘 Switch</div>
+    <div class="palette-item" draggable="true" data-type="checkbox">☑️ CheckBox</div>
+    <div class="palette-item" draggable="true" data-type="progressbar">📶 ProgressBar</div>
+    <div class="palette-item" draggable="true" data-type="seekbar">🎚️ SeekBar</div>
+
+    <div class="section-title">Lagen (dit scherm)</div>
+    <div class="layers" id="layers"><div class="empty-hint">Nog geen elementen op dit scherm.</div></div>
+  </div>
+
+  <div class="canvas-wrap">
+    <div class="canvas-toolbar">
+      <div class="tabs-row">
+        <div class="tabs-bar" id="tabsBar"></div>
+        <div class="tabs-add">
+          <button class="tb sm" id="btnAddScreen">+ Scherm</button>
+          <button class="tb sm" id="btnAddOverlay">+ Overlay</button>
+        </div>
+      </div>
+    </div>
+    <div class="phone">
+      <div class="statusbar"></div>
+      <div id="stage" class="stage"></div>
+      <div class="preview-banner" id="previewBanner" style="display:none;">▶ Voorbeeldmodus — klik om te testen</div>
+    </div>
+  </div>
+
+  <div class="props" id="props">
+    <div class="section-title">Eigenschappen</div>
+    <div class="empty-hint">Selecteer een element op het scherm om de eigenschappen te bewerken.</div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Code-export</h2>
+      <span class="x" id="modalClose">✕</span>
+    </div>
+    <div class="modal-body">
+      <label style="margin-top:0;">Scherm</label>
+      <select class="export-select" id="exportScreenSelect"></select>
+
+      <h4 id="xmlTitle">Layout XML</h4>
+      <div class="blk-actions">
+        <button class="tb sm" id="btnCopyXml">Kopiëren</button>
+        <button class="tb sm" id="btnDownloadXml">Download</button>
+      </div>
+      <pre id="xmlOutput"></pre>
+
+      <div id="drawableBlock" style="display:none;">
+        <h4>Achtergrond drawable (res/drawable/bg_overlay.xml)</h4>
+        <div class="hint">Nodig voor de afgeronde hoeken van de overlay-kaart.</div>
+        <div class="blk-actions">
+          <button class="tb sm" id="btnCopyDrawable">Kopiëren</button>
+          <button class="tb sm" id="btnDownloadDrawable">Download</button>
+        </div>
+        <pre id="drawableOutput"></pre>
+      </div>
+
+      <h4>Kotlin — klik-listeners</h4>
+      <div class="hint">Plak dit in de Activity/Fragment die deze layout gebruikt, na setContentView / inflate.</div>
+      <div class="blk-actions">
+        <button class="tb sm" id="btnCopyKotlin">Kopiëren</button>
+      </div>
+      <pre id="kotlinOutput"></pre>
+
+      <div id="manifestBlock" style="display:none;">
+        <h4>AndroidManifest.xml</h4>
+        <div class="hint">Nodig zodat het toetsenbord de invoervelden niet bedekt.</div>
+        <div class="blk-actions">
+          <button class="tb sm" id="btnCopyManifest">Kopiëren</button>
+        </div>
+        <pre id="manifestOutput"></pre>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="tb" id="btnDoneExport">Sluiten</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const stage = document.getElementById('stage');
+  const phoneEl = document.querySelector('.phone');
+  const propsPanel = document.getElementById('props');
+  const layersList = document.getElementById('layers');
+  const tabsBar = document.getElementById('tabsBar');
+  const previewBanner = document.getElementById('previewBanner');
+
+  let counter = 1;
+  let scrCounter = 2;
+  let selectedId = null;
+  let activeContainerEl = null;
+
+  let previewMode = false;
+  let previewStack = [];
+  let keyboardWidget = null;
+  let keyboardScreenId = null;
+
+  const DEFAULTS = {
+    button:     {w:120, h:44, text:'Button',    bg:'#6200ee', color:'#ffffff', fontSize:13},
+    textview:   {w:140, h:24, text:'TextView',  bg:'',        color:'#212121', fontSize:14},
+    edittext:   {w:160, h:40, text:'Hint text', bg:'#ffffff', color:'#888888', fontSize:13},
+    imageview:  {w:100, h:100,text:'',          bg:'',        color:'',        fontSize:11},
+    switch:     {w:90,  h:24, text:'Switch',    bg:'',        color:'#212121', fontSize:13},
+    checkbox:   {w:110, h:24, text:'CheckBox',  bg:'',        color:'#212121', fontSize:13},
+    progressbar:{w:160, h:8,  text:'',          bg:'',        color:'',        fontSize:0},
+    seekbar:    {w:160, h:20, text:'',          bg:'',        color:'',        fontSize:0},
+  };
+  const ANDROID_TAG = {
+    button:'Button', textview:'TextView', edittext:'EditText', imageview:'ImageView',
+    switch:'Switch', checkbox:'CheckBox', progressbar:'ProgressBar', seekbar:'SeekBar'
+  };
+  const CLICKABLE = ['button','switch','checkbox'];
+
+  let screens = [
+    { id:'scr_main', name:'Hoofdscherm', type:'screen', widgets:[] }
+  ];
+  let currentScreenId = 'scr_main';
+
+  function getScreen(id){ return screens.find(s=>s.id===id); }
+  function getCurrentScreen(){ return getScreen(currentScreenId); }
+  function otherScreens(type, excludeId){ return screens.filter(s=>s.type===type && s.id!==excludeId); }
+
+  // ---------- Screens ----------
+  function addScreen(type){
+    const id = 'scr'+(scrCounter++);
+    const name = type==='overlay' ? 'Overlay '+(scrCounter-1) : 'Scherm '+(scrCounter-1);
+    const s = { id, name, type, widgets:[] };
+    if(type==='overlay'){ s.cardW=280; s.cardH=260; s.cardBg='#ffffff'; s.cardRadius=14; }
+    screens.push(s);
+    currentScreenId = id;
+    selectedId = null;
+    render();
+  }
+  function deleteScreen(id){
+    const s = getScreen(id);
+    if(!s) return;
+    if(s.type==='screen' && screens.filter(x=>x.type==='screen').length<=1){
+      alert('Je moet minstens één gewoon scherm overhouden.'); return;
+    }
+    if(!confirm(`Scherm "${s.name}" verwijderen?`)) return;
+    screens = screens.filter(x=>x.id!==id);
+    screens.forEach(scr=> scr.widgets.forEach(w=>{
+      if(w.action && w.action.target===id){ w.action = {type:'none', target:null}; }
+    }));
+    if(currentScreenId===id) currentScreenId = screens[0].id;
+    selectedId = null;
+    render();
+  }
+
+  // ---------- Widgets ----------
+  function addWidget(type, x, y){
+    const d = DEFAULTS[type];
+    const w = {
+      id: 'w'+(counter++), type, x, y, w:d.w, h:d.h,
+      text:d.text, bg:d.bg, color:d.color, fontSize:d.fontSize,
+      idName: type + (counter-1),
+      action: {type:'none', target:null},
+      avoidKeyboard: true
+    };
+    getCurrentScreen().widgets.push(w);
+    selectedId = w.id;
+    render();
+  }
+
+  // ---------- Drag from palette ----------
+  document.querySelectorAll('.palette-item').forEach(item=>{
+    item.addEventListener('dragstart', e=> e.dataTransfer.setData('text/plain', item.dataset.type));
+  });
+  stage.addEventListener('dragover', e=>{ if(previewMode) return; e.preventDefault(); stage.classList.add('dragover'); });
+  stage.addEventListener('dragleave', ()=> stage.classList.remove('dragover'));
+  stage.addEventListener('drop', e=>{
+    if(previewMode) return;
+    e.preventDefault();
+    stage.classList.remove('dragover');
+    const type = e.dataTransfer.getData('text/plain');
+    if(!type || !activeContainerEl) return;
+    const rect = activeContainerEl.getBoundingClientRect();
+    const x = Math.max(0, Math.round(e.clientX - rect.left));
+    const y = Math.max(0, Math.round(e.clientY - rect.top));
+    addWidget(type, x, y);
+  });
+  stage.addEventListener('mousedown', e=>{
+    if(previewMode) return;
+    if(e.target===activeContainerEl || e.target===stage){ selectedId=null; render(); }
+  });
+  stage.addEventListener('click', e=>{
+    if(!previewMode) return;
+    if(keyboardWidget){
+      const insideKeyboard = e.target.closest('.kb-overlay');
+      const isEdit = e.target.closest('.w-edittext');
+      if(!insideKeyboard && !isEdit){ keyboardWidget=null; keyboardScreenId=null; render(); }
+    }
+  });
+
+  // ---------- Build a widget element ----------
+  function buildWidgetEl(w, scr){
+    const el = document.createElement('div');
+    el.className = 'widget w-'+w.type;
+    if(w.id===selectedId && !previewMode) el.className += ' selected';
+    if(previewMode && (CLICKABLE.includes(w.type) || w.type==='edittext')) el.className += ' clickable-hint';
+    el.style.left = w.x+'px';
+    el.style.top = w.y+'px';
+    el.style.width = w.w+'px';
+    el.style.height = w.h+'px';
+    el.dataset.id = w.id;
+
+    if(w.type==='button' || w.type==='textview' || w.type==='edittext'){
+      el.textContent = w.text;
+      if(w.bg) el.style.background = w.bg;
+      if(w.color) el.style.color = w.color;
+      el.style.fontSize = w.fontSize+'px';
+    } else if(w.type==='imageview'){
+      el.textContent = 'ImageView';
+    } else if(w.type==='switch'){
+      el.innerHTML = `<span>${w.text}</span><span class="track"><span class="thumb"></span></span>`;
+      el.style.color = w.color; el.style.fontSize = w.fontSize+'px';
+    } else if(w.type==='checkbox'){
+      el.innerHTML = `<span class="box"></span><span>${w.text}</span>`;
+      el.style.color = w.color; el.style.fontSize = w.fontSize+'px';
+    } else if(w.type==='seekbar'){
+      el.innerHTML = `<div class="seek-track"><div class="seek-thumb"></div></div>`;
+    }
+
+    if(!previewMode){
+      const handle = document.createElement('div');
+      handle.className = 'resize-handle';
+      el.appendChild(handle);
+      el.addEventListener('mousedown', e=> startDrag(e, w, el, handle));
+    } else {
+      el.addEventListener('click', e=>{ e.stopPropagation(); handlePreviewWidgetClick(w, scr); });
+    }
+    return el;
+  }
+
+  // ---------- Render: edit mode canvas ----------
+  function renderEditStage(){
+    stage.innerHTML = '';
+    const scr = getCurrentScreen();
+    if(scr.type==='screen'){
+      const layer = document.createElement('div');
+      layer.className = 'layer screen-layer';
+      stage.appendChild(layer);
+      activeContainerEl = layer;
+      scr.widgets.forEach(w => layer.appendChild(buildWidgetEl(w, scr)));
+    } else {
+      const backdrop = document.createElement('div');
+      backdrop.className = 'overlay-backdrop';
+      const card = document.createElement('div');
+      card.className = 'overlay-card';
+      card.style.width = scr.cardW+'px';
+      card.style.height = scr.cardH+'px';
+      card.style.background = scr.cardBg;
+      card.style.borderRadius = scr.cardRadius+'px';
+      backdrop.appendChild(card);
+      stage.appendChild(backdrop);
+      activeContainerEl = card;
+      scr.widgets.forEach(w => card.appendChild(buildWidgetEl(w, scr)));
+    }
+  }
+
+  // ---------- Render: preview mode ----------
+  function pickInitialScreen(){
+    const cur = getCurrentScreen();
+    if(cur.type==='screen') return cur.id;
+    const s = screens.find(x=>x.type==='screen');
+    return s ? s.id : screens[0].id;
+  }
+
+  function renderPreviewStage(){
+    stage.innerHTML = '';
+    activeContainerEl = null;
+    if(previewStack.length===0) previewStack = [pickInitialScreen()];
+
+    const baseScr = getScreen(previewStack[0]);
+    const baseLayer = document.createElement('div');
+    baseLayer.className = 'layer screen-layer';
+    baseLayer.dataset.screenId = baseScr.id;
+    baseScr.widgets.forEach(w => baseLayer.appendChild(buildWidgetEl(w, baseScr)));
+    stage.appendChild(baseLayer);
+
+    for(let i=1;i<previewStack.length;i++){
+      const ovScr = getScreen(previewStack[i]);
+      if(!ovScr) continue;
+      const backdrop = document.createElement('div');
+      backdrop.className = 'overlay-backdrop';
+      backdrop.addEventListener('click', e=>{
+        if(e.target===backdrop && previewStack.length>1){ previewStack.pop(); keyboardWidget=null; render(); }
+      });
+      const card = document.createElement('div');
+      card.className = 'overlay-card';
+      card.dataset.screenId = ovScr.id;
+      card.style.width = ovScr.cardW+'px';
+      card.style.height = ovScr.cardH+'px';
+      card.style.background = ovScr.cardBg;
+      card.style.borderRadius = ovScr.cardRadius+'px';
+      ovScr.widgets.forEach(w => card.appendChild(buildWidgetEl(w, ovScr)));
+      backdrop.appendChild(card);
+      stage.appendChild(backdrop);
+    }
+
+    if(keyboardWidget){
+      const containerEl = stage.querySelector(`[data-screen-id="${keyboardScreenId}"]`);
+      if(containerEl) appendKeyboardOverlay(containerEl, keyboardWidget);
+      else { keyboardWidget=null; keyboardScreenId=null; }
+    }
+  }
+
+  function appendKeyboardOverlay(containerEl, w){
+    const kb = document.createElement('div');
+    kb.className = 'kb-overlay';
+    kb.innerHTML = `
+      <div class="kb-head">⌨ Android-toetsenbord (simulatie) <span>⌄ Verberg</span></div>
+      <div class="kb-keys">
+        ${[10,10,9,5].map(()=> '<div class="kb-row">'+Array.from({length:7}).map(()=>'<div class="kb-key"></div>').join('')+'</div>').join('')}
+      </div>`;
+    kb.querySelector('.kb-head').addEventListener('click', ()=>{ keyboardWidget=null; keyboardScreenId=null; render(); });
+    phoneEl.appendChild(kb);
+
+    containerEl.style.transform = 'none';
+    const phoneRect = phoneEl.getBoundingClientRect();
+    const containerRect = containerEl.getBoundingClientRect();
+    const containerTopInPhone = containerRect.top - phoneRect.top;
+    const fieldBottomInPhone = containerTopInPhone + w.y + w.h;
+    const keyboardTopInPhone = phoneRect.height - 210;
+    const visibleLimit = keyboardTopInPhone - 12;
+    let shift = 0;
+    if(w.avoidKeyboard !== false){
+      shift = Math.max(0, fieldBottomInPhone - visibleLimit);
+    }
+    containerEl.style.transform = shift>0 ? `translateY(-${shift}px)` : 'none';
+  }
+
+  function handlePreviewWidgetClick(w, scr){
+    if(CLICKABLE.includes(w.type)){
+      keyboardWidget = null; keyboardScreenId = null;
+      const act = w.action || {type:'none'};
+      if(act.type==='showOverlay' && act.target && getScreen(act.target)){ previewStack.push(act.target); }
+      else if(act.type==='goToScreen' && act.target && getScreen(act.target)){ previewStack = [act.target]; }
+      else if(act.type==='closeOverlay'){ if(previewStack.length>1) previewStack.pop(); }
+      render();
+    } else if(w.type==='edittext'){
+      keyboardWidget = w; keyboardScreenId = scr.id;
+      render();
+    }
+  }
+
+  // ---------- Master render ----------
+  function render(){
+    renderTabs();
+    if(previewMode){ previewBanner.style.display='block'; renderPreviewStage(); }
+    else { previewBanner.style.display='none'; renderEditStage(); }
+    renderLayers();
+    renderProps();
+    autosave();
+  }
+
+  function renderTabs(){
+    tabsBar.innerHTML = '';
+    screens.forEach(s=>{
+      const chip = document.createElement('div');
+      chip.className = 'tab-chip' + (s.id===currentScreenId && !previewMode ? ' active' : '');
+      chip.innerHTML = `<span>${s.name}</span>${s.type==='overlay' ? '<span class="ov-badge">overlay</span>' : ''}<span class="del">✕</span>`;
+      chip.querySelector('span:first-child').addEventListener('click', ()=>{
+        if(previewMode) return;
+        currentScreenId = s.id; selectedId=null; render();
+      });
+      chip.querySelector('.del').addEventListener('click', e=>{ e.stopPropagation(); deleteScreen(s.id); });
+      tabsBar.appendChild(chip);
+    });
+  }
+
+  function renderLayers(){
+    const scr = getCurrentScreen();
+    if(scr.widgets.length===0){
+      layersList.innerHTML = '<div class="empty-hint">Nog geen elementen op dit scherm.</div>';
+      return;
+    }
+    layersList.innerHTML = '';
+    scr.widgets.forEach(w=>{
+      const row = document.createElement('div');
+      row.className = 'layer-item' + (w.id===selectedId?' active':'');
+      row.innerHTML = `<span>${ANDROID_TAG[w.type]} · ${w.idName}</span><span class="del">✕</span>`;
+      row.querySelector('span:first-child').addEventListener('click', ()=>{ if(previewMode) return; selectedId=w.id; render(); });
+      row.querySelector('.del').addEventListener('click', e=>{
+        e.stopPropagation();
+        scr.widgets = scr.widgets.filter(x=>x.id!==w.id);
+        if(selectedId===w.id) selectedId=null;
+        render();
+      });
+      layersList.appendChild(row);
+    });
+  }
+
+  function escapeAttr(s){ return (s||'').replace(/"/g,'&quot;'); }
+  function sanitizeId(v){ return v.replace(/[^a-zA-Z0-9_]/g,'_') || 'view'; }
+
+  // ---------- Props panel ----------
+  function renderProps(){
+    if(previewMode){
+      propsPanel.innerHTML = `<div class="section-title">Voorbeeldmodus</div>
+        <div class="empty-hint">Klik op knoppen, switches of checkboxes om acties te testen. Klik op een tekstveld om het toetsenbord te simuleren.</div>`;
+      return;
+    }
+    const scr = getCurrentScreen();
+    const w = scr.widgets.find(x=>x.id===selectedId);
+
+    if(!w){
+      let html = `<div class="section-title">Scherm</div>
+        <label>Naam</label><input type="text" id="p_screenName" value="${escapeAttr(scr.name)}">`;
+      if(scr.type==='overlay'){
+        html += `<div class="props-box">
+          <div class="section-title">Overlay-kaart</div>
+          <label>Breedte / hoogte (dp)</label>
+          <div class="row2">
+            <input type="number" id="p_cardW" value="${scr.cardW}">
+            <input type="number" id="p_cardH" value="${scr.cardH}">
+          </div>
+          <label>Achtergrondkleur</label>
+          <input type="color" id="p_cardBg" value="${scr.cardBg}">
+          <label>Hoekradius (dp)</label>
+          <input type="number" id="p_cardRadius" value="${scr.cardRadius}">
+        </div>`;
+      }
+      html += `<div class="empty-hint" style="margin-top:14px;">Sleep een component uit de lijst links naar het scherm, of selecteer een element om de eigenschappen te bewerken.</div>`;
+      propsPanel.innerHTML = html;
+
+      const bind = (id, fn) => { const el=document.getElementById(id); if(el) el.addEventListener('input', fn); };
+      bind('p_screenName', e=>{ scr.name = e.target.value; render(); });
+      bind('p_cardW', e=>{ scr.cardW = parseInt(e.target.value)||100; render(); });
+      bind('p_cardH', e=>{ scr.cardH = parseInt(e.target.value)||100; render(); });
+      bind('p_cardBg', e=>{ scr.cardBg = e.target.value; render(); });
+      bind('p_cardRadius', e=>{ scr.cardRadius = parseInt(e.target.value)||0; render(); });
+      return;
+    }
+
+    const showText = ['button','textview','edittext','switch','checkbox'].includes(w.type);
+    const showColor = ['button','textview','edittext','switch','checkbox'].includes(w.type);
+    const showBg = ['button','edittext'].includes(w.type);
+    const showFont = w.fontSize>0;
+    const isClickable = CLICKABLE.includes(w.type);
+    const isEditText = w.type==='edittext';
+
+    let html = `
+      <div class="section-title">Eigenschappen — ${ANDROID_TAG[w.type]}</div>
+      <label>ID (android:id)</label>
+      <input type="text" id="p_id" value="${w.idName}">
+      ${showText ? `<label>Tekst</label><input type="text" id="p_text" value="${escapeAttr(w.text)}">` : ''}
+      <label>Positie & grootte (dp)</label>
+      <div class="row2">
+        <input type="number" id="p_x" value="${w.x}" placeholder="x">
+        <input type="number" id="p_y" value="${w.y}" placeholder="y">
+      </div>
+      <div class="row2" style="margin-top:6px;">
+        <input type="number" id="p_w" value="${w.w}" placeholder="breedte">
+        <input type="number" id="p_h" value="${w.h}" placeholder="hoogte">
+      </div>
+      ${showFont ? `<label>Tekstgrootte (sp)</label><input type="number" id="p_font" value="${w.fontSize}">` : ''}
+      ${showColor ? `<label>Tekstkleur</label><input type="color" id="p_color" value="${w.color||'#212121'}">` : ''}
+      ${showBg ? `<label>Achtergrondkleur</label><input type="color" id="p_bg" value="${w.bg||'#ffffff'}">` : ''}
+    `;
+
+    if(isEditText){
+      html += `<label class="checkrow"><input type="checkbox" id="p_avoidKb" ${w.avoidKeyboard!==false?'checked':''}> Voorkom dat het toetsenbord dit veld bedekt</label>
+        <div class="empty-hint" style="margin-top:6px;">Test dit in Voorbeeldmodus: klik op het veld om het toetsenbord te simuleren.</div>`;
+    }
+
+    if(isClickable){
+      const act = w.action || {type:'none', target:null};
+      html += `<div class="props-box">
+        <div class="section-title">Klik-actie (verbinden)</div>
+        <label>Wat moet er gebeuren?</label>
+        <select id="p_actionType">
+          <option value="none" ${act.type==='none'?'selected':''}>Geen</option>
+          <option value="showOverlay" ${act.type==='showOverlay'?'selected':''}>Toon overlay…</option>
+          <option value="goToScreen" ${act.type==='goToScreen'?'selected':''}>Ga naar scherm…</option>
+          <option value="closeOverlay" ${act.type==='closeOverlay'?'selected':''}>Sluit overlay (terug)</option>
+        </select>`;
+
+      if(act.type==='showOverlay' || act.type==='goToScreen'){
+        const targets = act.type==='showOverlay' ? otherScreens('overlay', scr.id) : otherScreens('screen', scr.id);
+        html += `<label>Welk scherm?</label><select id="p_actionTarget">
+          <option value="">— kies —</option>
+          ${targets.map(t=>`<option value="${t.id}" ${act.target===t.id?'selected':''}>${escapeAttr(t.name)}</option>`).join('')}
+        </select>`;
+        if(targets.length===0) html += `<div class="empty-hint" style="margin-top:6px;">Maak eerst een ${act.type==='showOverlay'?'overlay':'scherm'} aan via de "+"-knop boven het canvas.</div>`;
+      }
+      html += `</div>`;
+    }
+
+    propsPanel.innerHTML = html;
+
+    const bind = (id, fn) => { const el=document.getElementById(id); if(el) el.addEventListener('input', fn); };
+    bind('p_id', e=>{ w.idName = sanitizeId(e.target.value); });
+    bind('p_text', e=>{ w.text = e.target.value; render(); });
+    bind('p_x', e=>{ w.x = parseInt(e.target.value)||0; render(); });
+    bind('p_y', e=>{ w.y = parseInt(e.target.value)||0; render(); });
+    bind('p_w', e=>{ w.w = parseInt(e.target.value)||10; render(); });
+    bind('p_h', e=>{ w.h = parseInt(e.target.value)||10; render(); });
+    bind('p_font', e=>{ w.fontSize = parseInt(e.target.value)||12; render(); });
+    bind('p_color', e=>{ w.color = e.target.value; render(); });
+    bind('p_bg', e=>{ w.bg = e.target.value; render(); });
+    bind('p_avoidKb', e=>{ w.avoidKeyboard = e.target.checked; render(); });
+    const actType = document.getElementById('p_actionType');
+    if(actType) actType.addEventListener('change', e=>{ w.action = {type:e.target.value, target:null}; render(); });
+    const actTarget = document.getElementById('p_actionTarget');
+    if(actTarget) actTarget.addEventListener('change', e=>{ w.action.target = e.target.value || null; render(); });
+  }
+
+  // ---------- Edit-mode drag / resize ----------
+  let dragState = null;
+  function startDrag(e, w, el, handle){
+    e.stopPropagation();
+    selectedId = w.id;
+    const isResize = e.target===handle;
+    const rect = activeContainerEl.getBoundingClientRect();
+    dragState = { w, isResize, startX:e.clientX, startY:e.clientY, origX:w.x, origY:w.y, origW:w.w, origH:w.h, rect };
+    render();
+    document.addEventListener('mousemove', onDragMove);
+    document.addEventListener('mouseup', onDragEnd);
+  }
+  function onDragMove(e){
+    if(!dragState) return;
+    const dx = e.clientX - dragState.startX;
+    const dy = e.clientY - dragState.startY;
+    const w = dragState.w;
+    if(dragState.isResize){
+      w.w = Math.max(20, dragState.origW + dx);
+      w.h = Math.max(16, dragState.origH + dy);
+    } else {
+      w.x = Math.max(0, Math.min(dragState.origX + dx, dragState.rect.width - w.w));
+      w.y = Math.max(0, Math.min(dragState.origY + dy, dragState.rect.height - w.h));
+    }
+    render();
+  }
+  function onDragEnd(){
+    dragState = null;
+    document.removeEventListener('mousemove', onDragMove);
+    document.removeEventListener('mouseup', onDragEnd);
+  }
+
+  // ---------- Toolbar actions ----------
+  document.getElementById('btnAddScreen').addEventListener('click', ()=> addScreen('screen'));
+  document.getElementById('btnAddOverlay').addEventListener('click', ()=> addScreen('overlay'));
+
+  document.getElementById('btnPreview').addEventListener('click', (e)=>{
+    previewMode = !previewMode;
+    e.target.textContent = previewMode ? '■ Stop voorbeeld' : '▶ Voorbeeld';
+    e.target.classList.toggle('active', previewMode);
+    if(previewMode){ previewStack = [pickInitialScreen()]; selectedId=null; keyboardWidget=null; keyboardScreenId=null; }
+    else { previewStack = []; keyboardWidget=null; keyboardScreenId=null; }
+    render();
+  });
+
+  document.getElementById('btnClear').addEventListener('click', ()=>{
+    if(!confirm('Het hele project (alle schermen) wissen?')) return;
+    screens = [{ id:'scr_main', name:'Hoofdscherm', type:'screen', widgets:[] }];
+    currentScreenId = 'scr_main'; selectedId=null; previewMode=false; previewStack=[];
+    document.getElementById('btnPreview').textContent='▶ Voorbeeld';
+    document.getElementById('btnPreview').classList.remove('active');
+    render();
+  });
+
+  document.getElementById('btnSaveJson').addEventListener('click', ()=>{
+    const data = { screens, currentScreenId };
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'android-gui-project.json';
+    a.click();
+  });
+  document.getElementById('btnLoadJson').addEventListener('click', ()=> document.getElementById('fileLoad').click());
+  document.getElementById('fileLoad').addEventListener('change', e=>{
+    const file = e.target.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try{
+        const data = JSON.parse(reader.result);
+        screens = data.screens || data;
+        currentScreenId = data.currentScreenId || screens[0].id;
+        let maxW=0, maxS=0;
+        screens.forEach(s=>{
+          const n = parseInt((s.id||'').replace('scr','')); if(!isNaN(n)) maxS=Math.max(maxS,n);
+          s.widgets.forEach(w=>{
+            const wn = parseInt((w.id||'').replace('w','')); if(!isNaN(wn)) maxW=Math.max(maxW,wn);
+            if(!w.action) w.action = {type:'none', target:null};
+            if(w.avoidKeyboard===undefined) w.avoidKeyboard = true;
+          });
+        });
+        counter = maxW+1; scrCounter = maxS+1;
+        selectedId = null; previewMode=false; previewStack=[];
+        render();
+      }catch(err){ alert('Kon het bestand niet laden: ' + err.message); }
+    };
+    reader.readAsText(file);
+  });
+
+  // ---------- Export ----------
+  function pascalCase(str){ return (str||'screen').replace(/[^a-zA-Z0-9]+/g,' ').trim().split(' ').map(s=>s.charAt(0).toUpperCase()+s.slice(1)).join(''); }
+  function snakeCase(str){ return (str||'screen').toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,''); }
+  function xmlEscape(s){ return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  function actionComment(w){
+    const act = w.action;
+    if(!act || act.type==='none') return null;
+    if(act.type==='showOverlay'){ const t=getScreen(act.target); return t ? `Klik-actie: toont overlay "${t.name}"` : null; }
+    if(act.type==='goToScreen'){ const t=getScreen(act.target); return t ? `Klik-actie: navigeert naar scherm "${t.name}"` : null; }
+    if(act.type==='closeOverlay'){ return 'Klik-actie: sluit deze overlay'; }
+    return null;
+  }
+
+  function widgetAttrs(w){
+    const attrs = [];
+    attrs.push(`android:id="@+id/${w.idName}"`);
+    attrs.push(`android:layout_width="${w.w}dp"`);
+    attrs.push(`android:layout_height="${w.h}dp"`);
+    attrs.push(`android:layout_marginStart="${w.x}dp"`);
+    attrs.push(`android:layout_marginTop="${w.y}dp"`);
+    if(w.fontSize>0) attrs.push(`android:textSize="${w.fontSize}sp"`);
+    if(['button','textview','edittext'].includes(w.type)){
+      if(w.type==='edittext') attrs.push(`android:hint="${xmlEscape(w.text)}"`);
+      else attrs.push(`android:text="${xmlEscape(w.text)}"`);
+    }
+    if(w.type==='switch' || w.type==='checkbox') attrs.push(`android:text="${xmlEscape(w.text)}"`);
+    if(w.color) attrs.push(`android:textColor="${w.color}"`);
+    if(w.bg) attrs.push(`android:background="${w.bg}"`);
+    if(w.type==='imageview') attrs.push(`android:scaleType="centerCrop"`, `android:src="@drawable/placeholder"`);
+    if(w.type==='progressbar') attrs.push(`style="?android:attr/progressBarStyleHorizontal"`, `android:progress="60"`);
+    if(w.type==='seekbar') attrs.push(`android:progress="40"`);
+    return attrs;
+  }
+
+  function buildXmlForScreen(scr){
+    const needsScroll = scr.type==='screen' && scr.widgets.some(w=>w.type==='edittext' && w.avoidKeyboard!==false);
+    const lines = [];
+    lines.push('<?xml version="1.0" encoding="utf-8"?>');
+    if(needsScroll){
+      lines.push('<!-- Belangrijk: zet in AndroidManifest.xml op deze Activity android:windowSoftInputMode="adjustResize" -->');
+      lines.push('<!-- zodat het toetsenbord de invoervelden hieronder niet bedekt. -->');
+    }
+
+    const rootOpenLines = [];
+    let indent = '    ';
+    if(scr.type==='screen'){
+      if(needsScroll){
+        rootOpenLines.push('<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"');
+        rootOpenLines.push('    android:layout_width="match_parent"');
+        rootOpenLines.push('    android:layout_height="match_parent"');
+        rootOpenLines.push('    android:fillViewport="true">');
+        rootOpenLines.push('');
+        rootOpenLines.push('    <FrameLayout');
+        rootOpenLines.push('        android:layout_width="match_parent"');
+        rootOpenLines.push('        android:layout_height="match_parent">');
+        indent = '        ';
+      } else {
+        rootOpenLines.push('<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"');
+        rootOpenLines.push('    android:layout_width="match_parent"');
+        rootOpenLines.push('    android:layout_height="match_parent">');
+      }
+    } else {
+      rootOpenLines.push('<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"');
+      rootOpenLines.push(`    android:layout_width="${scr.cardW}dp"`);
+      rootOpenLines.push(`    android:layout_height="${scr.cardH}dp"`);
+      rootOpenLines.push('    android:background="@drawable/bg_overlay">');
+    }
+    lines.push(...rootOpenLines, '');
+
+    scr.widgets.forEach(w=>{
+      const comment = actionComment(w);
+      if(comment) lines.push(`${indent}<!-- ${comment} -->`);
+      const attrs = widgetAttrs(w);
+      lines.push(`${indent}<${ANDROID_TAG[w.type]}`);
+      attrs.forEach((a,i)=> lines.push(`${indent}    ${a}${i===attrs.length-1 ? ' />' : ''}`));
+      lines.push('');
+    });
+
+    if(scr.type==='screen' && needsScroll){
+      lines.push('    </FrameLayout>');
+      lines.push('</ScrollView>');
+    } else {
+      lines.push('</FrameLayout>');
+    }
+    return lines.join('\n');
+  }
+
+  function buildDrawableForOverlay(scr){
+    return `<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <solid android:color="${scr.cardBg}" />
+    <corners android:radius="${scr.cardRadius}dp" />
+</shape>`;
+  }
+
+  function buildKotlinForScreen(scr){
+    const acted = scr.widgets.filter(w=> CLICKABLE.includes(w.type) && w.action && w.action.type!=='none');
+    if(acted.length===0) return '// Geen klik-acties geconfigureerd op dit scherm.';
+    const lines = [`// Voeg toe in de Activity/Fragment die deze layout gebruikt (na setContentView/inflate)`, ''];
+    acted.forEach(w=>{
+      const tag = ANDROID_TAG[w.type];
+      lines.push(`val ${w.idName} = findViewById<${tag}>(R.id.${w.idName})`);
+      lines.push(`${w.idName}.setOnClickListener {`);
+      const act = w.action;
+      if(act.type==='showOverlay'){
+        const t = getScreen(act.target);
+        const name = t ? t.name : 'Overlay';
+        lines.push(`    // Toon de "${name}" overlay — bv. met een DialogFragment die dialog_${snakeCase(name)}.xml gebruikt`);
+        lines.push(`    ${pascalCase(name)}Dialog().show(supportFragmentManager, "${snakeCase(name)}")`);
+      } else if(act.type==='goToScreen'){
+        const t = getScreen(act.target);
+        const name = t ? t.name : 'Scherm';
+        lines.push(`    startActivity(Intent(this, ${pascalCase(name)}Activity::class.java))`);
+      } else if(act.type==='closeOverlay'){
+        lines.push(`    dismiss() // als dit in een DialogFragment staat, anders: overlayView.visibility = View.GONE`);
+      }
+      lines.push(`}`, '');
+    });
+    return lines.join('\n');
+  }
+
+  function buildManifestSnippet(){
+    return `<activity
+    android:name=".MainActivity"
+    android:windowSoftInputMode="adjustResize" />`;
+  }
+
+  const modalOverlay = document.getElementById('modalOverlay');
+  const exportSelect = document.getElementById('exportScreenSelect');
+
+  function updateExportPreview(){
+    const scr = getScreen(exportSelect.value) || getCurrentScreen();
+    document.getElementById('xmlTitle').textContent = scr.type==='overlay'
+      ? `Layout XML — dialog_${snakeCase(scr.name)}.xml`
+      : `Layout XML — activity_${snakeCase(scr.name)}.xml`;
+    document.getElementById('xmlOutput').textContent = buildXmlForScreen(scr);
+    document.getElementById('kotlinOutput').textContent = buildKotlinForScreen(scr);
+
+    const drawableBlock = document.getElementById('drawableBlock');
+    if(scr.type==='overlay'){
+      drawableBlock.style.display = 'block';
+      document.getElementById('drawableOutput').textContent = buildDrawableForOverlay(scr);
+    } else {
+      drawableBlock.style.display = 'none';
+    }
+
+    const needsScroll = scr.type==='screen' && scr.widgets.some(w=>w.type==='edittext' && w.avoidKeyboard!==false);
+    const manifestBlock = document.getElementById('manifestBlock');
+    if(needsScroll){
+      manifestBlock.style.display = 'block';
+      document.getElementById('manifestOutput').textContent = buildManifestSnippet();
+    } else {
+      manifestBlock.style.display = 'none';
+    }
+  }
+
+  document.getElementById('btnExport').addEventListener('click', ()=>{
+    exportSelect.innerHTML = screens.map(s=>`<option value="${s.id}">${escapeAttr(s.name)}${s.type==='overlay'?' (overlay)':''}</option>`).join('');
+    exportSelect.value = currentScreenId;
+    updateExportPreview();
+    modalOverlay.classList.add('open');
+  });
+  exportSelect.addEventListener('change', updateExportPreview);
+  document.getElementById('modalClose').addEventListener('click', ()=> modalOverlay.classList.remove('open'));
+  document.getElementById('btnDoneExport').addEventListener('click', ()=> modalOverlay.classList.remove('open'));
+  modalOverlay.addEventListener('click', e=>{ if(e.target===modalOverlay) modalOverlay.classList.remove('open'); });
+
+  function copyText(text, btn){
+    navigator.clipboard.writeText(text).then(()=>{
+      const old = btn.textContent; btn.textContent='Gekopieerd!';
+      setTimeout(()=> btn.textContent = old, 1200);
+    });
+  }
+  function downloadText(text, filename){
+    const blob = new Blob([text], {type:'text/plain'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+  }
+
+  document.getElementById('btnCopyXml').addEventListener('click', e=> copyText(document.getElementById('xmlOutput').textContent, e.target));
+  document.getElementById('btnDownloadXml').addEventListener('click', ()=>{
+    const scr = getScreen(exportSelect.value) || getCurrentScreen();
+    const fname = scr.type==='overlay' ? `dialog_${snakeCase(scr.name)}.xml` : `activity_${snakeCase(scr.name)}.xml`;
+    downloadText(document.getElementById('xmlOutput').textContent, fname);
+  });
+  document.getElementById('btnCopyDrawable').addEventListener('click', e=> copyText(document.getElementById('drawableOutput').textContent, e.target));
+  document.getElementById('btnDownloadDrawable').addEventListener('click', ()=> downloadText(document.getElementById('drawableOutput').textContent, 'bg_overlay.xml'));
+  document.getElementById('btnCopyKotlin').addEventListener('click', e=> copyText(document.getElementById('kotlinOutput').textContent, e.target));
+  document.getElementById('btnCopyManifest').addEventListener('click', e=> copyText(document.getElementById('manifestOutput').textContent, e.target));
+
+  // ---------- Autosave ----------
+  function autosave(){
+    try{ localStorage.setItem('android_gui_builder_project', JSON.stringify({screens, currentScreenId})); }catch(e){}
+  }
+  function loadAutosave(){
+    try{
+      const raw = localStorage.getItem('android_gui_builder_project');
+      if(raw){
+        const data = JSON.parse(raw);
+        if(data.screens && data.screens.length){
+          screens = data.screens;
+          currentScreenId = data.currentScreenId || screens[0].id;
+          let maxW=0, maxS=0;
+          screens.forEach(s=>{
+            const n = parseInt((s.id||'').replace('scr','')); if(!isNaN(n)) maxS=Math.max(maxS,n);
+            s.widgets.forEach(w=>{
+              const wn = parseInt((w.id||'').replace('w','')); if(!isNaN(wn)) maxW=Math.max(maxW,wn);
+              if(!w.action) w.action = {type:'none', target:null};
+              if(w.avoidKeyboard===undefined) w.avoidKeyboard = true;
+            });
+          });
+          counter = maxW+1; scrCounter = Math.max(maxS+1, 2);
+        }
+      }
+    }catch(e){}
+  }
+
+  loadAutosave();
+  render();
+})();
+</script>
+</body>
+</html>
