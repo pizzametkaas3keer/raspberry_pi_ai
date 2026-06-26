@@ -63,3 +63,7 @@ The Pi app can now perform simple actions. For security, this operates primarily
 
 **one last thing:**
 - you could run this probably on any device that is linux or windows
+
+
+## Notice
+it is possible to run this probably on anydevice that has python installed keep in mind the opengl/pyopengl needs to have the same version but i hope that thats no problem
