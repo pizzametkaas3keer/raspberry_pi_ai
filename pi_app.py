@@ -1,15 +1,20 @@
 import argparse
 import array
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import subprocess
 import threading
 import time
 import uuid
+from datetime import datetime
+from io import BytesIO
 import moderngl
 import pygame
 import requests
@@ -17,65 +22,318 @@ import websockets
 from dataclasses import dataclass
 from pathlib import Path
 import glob
-from jarvis_sandbox.pi_app import read_gpu_temperature
 
+# Forceer GPU/Vulkan ondersteuning voor Ollama indien beschikbaar op dit systeem
+os.environ["OLLAMA_VULKAN"] = "1"
+os.environ["GGML_VULKAN"] = "1"
+# Gebruik alle beschikbare cores voor inference op de Pi 5
+os.environ["OMP_NUM_THREADS"] = "4"
 
-# Probeer optioneel `langdetect` te gebruiken voor brede taalherkenning.
-try:
-    from langdetect import detect, DetectorFactory
+# ═══════════════════════════════════════════════════════════════════════════════
+# ⚙️  INSTELLINGEN - PAS DEZE AAN NAAR WENS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    DetectorFactory.seed = 0
-    LANGDETECT_AVAILABLE = True
-except Exception:
-    LANGDETECT_AVAILABLE = False
+DEFAULT_GENERAL_MODEL = "qwen3:8b"     # Snelle standaard voor tekst
+DEFAULT_VISION_MODEL = "qwen2.5vl:7b"   # Voor scherm- en afbeeldingsanalyse
+DEFAULT_CODER_MODEL = "qwen2.5-coder:3b" # Voor programmeer-gerelateerde vragen
+IDLE_MODELS = ["qwen3:8b", "qwen2.5vl:7b", "qwen2.5-coder:3b"] # Modellen die we in GPU-idle willen houden
 
-# Mapping korte taalcode -> leesbare taalnaam (voor AI prompts)
-LANG_NAME_MAP = {
-    "nl": "Nederlands",
-    "en": "English",
-    "fr": "Français",
-    "es": "Español",
-    "de": "Deutsch",
-    "pt": "Português",
-    "it": "Italiano",
-}
-
-WS_LOGGER = logging.getLogger("pi_app.websockets")
-WS_LOGGER.setLevel(logging.CRITICAL)
-WS_LOGGER.propagate = False
-
-
-OLLAMA_API = "http://127.0.0.1:11434/api/chat"
-PROJECT_DIR = Path(__file__).resolve().parent
-HOME_DIR = Path.home()
-DEFAULT_WORK_DIR = HOME_DIR / "Desktop"
-EMOTION_KEYWORDS = {
-    "sad": ["sorry", "jammer", "helaas", "verdriet"],
-    "happy": ["wow", "top", "geweldig", "yes", "blij"],
-    "angry": ["boos", "fout", "nee", "stop"],
-}
-EMOTION_LEVELS = {
-    "neutral": 0.28,
-    "happy": 0.65,
-    "sad": 0.12,
-    "angry": 0.90,
-}
-EMOTION_COLORS = {
-    "neutral": (140, 235, 255),
-    "happy": (255, 210, 80),
-    "sad": (80, 110, 210),
-    "angry": (255, 110, 110),
-}
-EMOTION_PROFILES = {
-    "neutral": {"speed": 1.0, "shape": 1.0, "offset": 0, "thickness": 6},
-    "happy": {"speed": 1.35, "shape": 1.25, "offset": -6, "thickness": 7},
-    "sad": {"speed": 0.65, "shape": 0.55, "offset": 24, "thickness": 5},
-    "angry": {"speed": 1.8, "shape": 1.55, "offset": 0, "thickness": 8},
-}
+# Paden
+PROJECT_DIR = Path(__file__).parent
 PI_TEMP_PATH = Path("/sys/class/thermal/thermal_zone0/temp")
 MEMINFO_PATH = Path("/proc/meminfo")
-ALLOWED_IPS_PATH = PROJECT_DIR / "allowed_ips.json"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🛠️  HELPER CLASSES & FUNCTIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class VisualState:
+    emotion: str = "neutral"
+    previous_emotion: str = "neutral"
+    text: str = ""
+    level: float = 0.35
+    transition: float = 1.0
+    audio_level: float = 0.0
+    active_model: str | None = None
+
+
+@dataclass
+class ButtonRect:
+    x: int
+    y: int
+    w: int
+    h: int
+    action: str
+
+
+class ConnectionGate:
+    """Beheert per-verbinding goedkeuringen voor veiligheid."""
+
+    @dataclass
+    class PendingConnection:
+        client_id: str
+        label: str
+        accept_event: asyncio.Event
+        decision: str = "pending"  # pending, accepted, rejected
+
+    def __init__(self):
+        self.pending: dict[str, self.PendingConnection] = {}
+        self.allowed_ips: set[str] = self._load_allowed_ips()
+        self.lock = threading.Lock()
+
+    def _load_allowed_ips(self) -> set[str]:
+        path = PROJECT_DIR / "allowed_ips.json"
+        if path.exists():
+            try:
+                return set(json.loads(path.read_text()))
+            except (json.JSONDecodeError, OSError):
+                return set()
+        return set()
+
+    def _save_allowed_ips(self):
+        path = PROJECT_DIR / "allowed_ips.json"
+        path.write_text(json.dumps(list(self.allowed_ips)))
+
+    def request(self, label: str, ip: str | None = None) -> PendingConnection:
+        client_id = str(uuid.uuid4())[:8]
+        conn = self.PendingConnection(client_id, label, asyncio.Event())
+        with self.lock:
+            self.pending[client_id] = conn
+        return conn
+
+    def approve(self, client_id: str, accept: bool, always: bool = False, ip: str | None = None):
+        with self.lock:
+            conn = self.pending.get(client_id)
+            if not conn:
+                return
+            conn.decision = "accepted" if accept else "rejected"
+            if accept and always and ip:
+                self.allowed_ips.add(ip)
+                self._save_allowed_ips()
+            # Gebruik call_soon_threadsafe voor de event loop van de server
+            # Deze methode wordt vanuit de GUI-thread aangeroepen.
+            loop = getattr(self, "_server_loop", None)
+            if loop:
+                loop.call_soon_threadsafe(conn.accept_event.set)
+
+    def is_allowed(self, ip: str) -> bool:
+        return ip in self.allowed_ips
+
+    def remove(self, client_id: str):
+        with self.lock:
+            if client_id in self.pending:
+                del self.pending[client_id]
+
+    def snapshot(self) -> list[PendingConnection]:
+        with self.lock:
+            return list(self.pending.values())
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop):
+        self._server_loop = loop
+
+
+class SharedState:
+    def __init__(self):
+        self._visual = VisualState()
+        self._lock = threading.Lock()
+        self.gate = ConnectionGate()
+
+    def set(self, emotion: str, text: str, level: float):
+        with self._lock:
+            if self._visual.emotion != emotion:
+                self._visual.previous_emotion = self._visual.emotion
+                self._visual.transition = 0.0
+            self._visual.emotion = emotion
+            self._visual.text = text
+            self._visual.level = level
+
+    def get(self) -> VisualState:
+        with self._lock:
+            return self._visual
+
+    def step_transition(self, dt: float):
+        with self._lock:
+            self._visual.transition = min(1.0, self._visual.transition + dt)
+
+    def update_visual(self, emotion: str = None, text: str = None, audio_level: float = None, active_model: str = None):
+        with self._lock:
+            if emotion is not None:
+                if self._visual.emotion != emotion:
+                    self._visual.previous_emotion = self._visual.emotion
+                    self._visual.transition = 0.0
+                self._visual.emotion = emotion
+            if text is not None:
+                self._visual.text = text
+            if audio_level is not None:
+                self._visual.audio_level = audio_level
+            if active_model is not None:
+                self._visual.active_model = active_model
+
+    def approve_top_connection(self, accept: bool, always: bool = False):
+        pending = self.gate.snapshot()
+        if pending:
+            top = pending[0]
+            # Voor de IP-allowlist moeten we eigenlijk de IP weten, maar de GUI-thread
+            # heeft die nu niet direct. In een echte app zouden we die opslaan in PendingConnection.
+            self.gate.approve(top.client_id, accept, always)
+
+    def set_server_loop(self, loop: asyncio.AbstractEventLoop):
+        self.gate.set_loop(loop)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🤖 AI CORE - OLLAMA INTEGRATIE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_emotion(text: str) -> str:
+    text = text.lower()
+    if any(w in text for w in ["hoera", "geweldig", "blij", "leuk", "fijn", "top", "super"]):
+        return "happy"
+    if any(w in text for w in ["helaas", "jammer", "verdrietig", "slecht", "pijn", "moeilijk"]):
+        return "sad"
+    if any(w in text for w in ["boos", "irritant", "stom", "fout", "foutmelding", "verschrikkelijk"]):
+        return "angry"
+    return "neutral"
+
+
+async def ask_ollama_async(model: str, prompt: str) -> str:
+    """Async variant van de Ollama API aanroep voor betere server performance."""
+    try:
+        # NOTE: pi_app.py gebruikt requests (blocking). 
+        # Voor de server is dit OK zolang het in een aparte thread/coroutine draait.
+        return await asyncio.to_thread(call_ollama_api, model, prompt)
+    except Exception as exc:
+        return f"AI fout: {exc}"
+
+
+def get_available_models() -> list[str]:
+    """Haal een lijst van alle beschikbare Ollama modellen op."""
+    try:
+        resp = requests.get("http://127.0.0.1:11434/api/tags", timeout=5)
+        if resp.status_code == 200:
+            return [m["name"] for m in resp.json().get("models", [])]
+    except:
+        pass
+    return []
+
+
+def call_ollama_api(model: str, prompt: str, timeout: int = 60, images: list[str] = None, system_prompt: str = None) -> str:
+    """Blocking Ollama API aanroep met automatische fallback bij fouten of ontbrekende modellen."""
+    url = "http://127.0.0.1:11434/api/chat"
+
+    # Controleer eerst of het model überhaupt bestaat, anders direct fallback
+    available = get_available_models()
+    
+    selected_model = model
+    if model not in available and available:
+        # Fallback volgorde: qwen3:8b -> qwen2.5-coder:3b -> qwen2.5vl:7b -> eerste in de lijst
+        if DEFAULT_GENERAL_MODEL in available:
+            selected_model = DEFAULT_GENERAL_MODEL
+        elif DEFAULT_CODER_MODEL in available:
+            selected_model = DEFAULT_CODER_MODEL
+        elif DEFAULT_VISION_MODEL in available:
+            selected_model = DEFAULT_VISION_MODEL
+        else:
+            selected_model = available[0]
+        print(f"⚠️ Model '{model}' niet gevonden. Gebruik fallback: {selected_model}")
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+
+    msg = {"role": "user", "content": prompt}
+    if images:
+        msg["images"] = images
+    messages.append(msg)
+
+    payload = {
+        "model": selected_model,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "num_predict": 500,
+            "temperature": 0.7
+        }
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.json().get("message", {}).get("content", "")
+        
+        # Specifieke foutafhandeling voor model mismatch (als tags check faalde)
+        body = resp.text
+        if resp.status_code == 404:
+            print(f"Ollama kon model '{selected_model}' niet vinden (404).")
+            if selected_model != DEFAULT_GENERAL_MODEL:
+                print(f"Poging tot fallback naar {DEFAULT_GENERAL_MODEL}")
+                return call_ollama_api(DEFAULT_GENERAL_MODEL, prompt, timeout, images, system_prompt)
+        
+        return f"Ollama fout (code {resp.status_code}): {body}"
+    except Exception as e:
+        return f"Verbindingsfout met Ollama: {e}"
+
+
+async def analyze_screen_capture(image_base64: str, question: str = None, section: str = "full", model: str = DEFAULT_VISION_MODEL) -> tuple[str, str]:
+    """Analyseert een screenshot met een Vision model."""
+    if not question:
+        question = "Beschrijf kort wat je ziet op dit scherm of deze afbeelding."
+
+    # Verbeterde systeeminstructie voor Vision-modellen om directer te zijn
+    system_instr = (
+        "Je bent Jarvis, een behulpzame assistent die meekijkt op het scherm van de gebruiker. "
+        "Geef DIRECT antwoord op de vraag van de gebruiker. Geef geen algemene beschrijving "
+        "van het scherm als de gebruiker een specifieke vraag stelt. "
+        "Houd je antwoord kort, krachtig en to-the-point."
+    )
+
+    try:
+        answer = await asyncio.to_thread(call_ollama_api, model, question, 60, [image_base64], system_instr)
+        return answer, detect_emotion(answer)
+    except Exception as exc:
+        return f"Schermafbeelding analyse mislukt: {exc}", "angry"
+
+
+def unload_models():
+    """Maakt GPU-geheugen vrij door modellen te unloaden."""
+    try:
+        # Dit vertelt Ollama om alles uit GPU/RAM te gooien
+        requests.post("http://127.0.0.1:11434/api/chat", json={
+            "model": "qwen3:8b", # Of een ander model dat geladen is
+            "keep_alive": 0
+        }, timeout=5)
+        print("🧹 Modellen uit GPU/RAM verwijderd.")
+    except:
+        pass
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🎨 GUI - PYGAME & MODERNGL WAVE VISUAL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+EMOTION_COLORS = {
+    "neutral": (100, 160, 255),
+    "happy": (120, 255, 140),
+    "sad": (140, 150, 180),
+    "angry": (255, 100, 100),
+}
+
+EMOTION_LEVELS = {
+    "neutral": 0.35,
+    "happy": 0.85,
+    "sad": 0.15,
+    "angry": 1.0,
+}
+
+EMOTION_PROFILES = {
+    "neutral": {"shape": 1.0, "speed": 1.0, "thickness": 10, "offset": 0},
+    "happy": {"shape": 1.3, "speed": 1.8, "thickness": 14, "offset": -20},
+    "sad": {"shape": 0.4, "speed": 0.5, "thickness": 6, "offset": 40},
+    "angry": {"shape": 2.2, "speed": 3.5, "thickness": 18, "offset": -10},
+}
+
 STOP_KEYS = (pygame.K_LCTRL, pygame.K_RCTRL, pygame.K_ESCAPE)
+
 ENERGY_VERTEX_SHADER = """
 #version 120
 attribute vec2 in_vert;
@@ -130,14 +388,14 @@ void main() {
     float calm_volume = smoothstep(0.02, 0.90, volume);
     float thinking_pulse = thinking * (0.55 + 0.45 * sin(iTime * 2.2));
     float energy_flares = fbm(uv * 3.4 - vec2(0.0, iTime * 0.55)) * (0.055 + calm_volume * 0.28 + thinking * 0.08);
-    float core_radius = 0.20 + (calm_volume * 0.055) + thinking_pulse * 0.018;
+    float core_radius = 0.37 + (calm_volume * 0.055) + thinking_pulse * 0.018;
     float shell = abs(d - core_radius - energy_flares);
-    float core_glow = 0.005 / (shell + 0.002);
+    float core_glow = 0.007 / (shell + 0.004);
     float white_hot_center = exp(-d * (6.2 - calm_volume * 1.0));
     float ambient_glow = exp(-d * 2.5) * (0.14 + calm_volume * 0.42 + thinking * 0.16);
 
     float scan_angle = atan(uv.y, uv.x) + iTime * 1.4;
-    float thinking_arc = thinking * smoothstep(0.035, 0.0, abs(d - 0.42)) * (0.35 + 0.65 * smoothstep(0.55, 0.95, sin(scan_angle * 3.0)));
+    float thinking_arc = thinking * smoothstep(0.035, 0.0, abs(d - 0.59)) * (0.35 + 0.65 * smoothstep(0.55, 0.95, sin(scan_angle * 3.0)));
 
     vec3 color_green = vec3(0.0, 1.0, 0.45);
     vec3 color_yellow = vec3(1.0, 0.9, 0.0);
@@ -197,785 +455,170 @@ void main() {
 }
 """
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🌐 WEBSOCKET SERVER - COMMUNICATIE MET LAPTOP/MOBILE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-@dataclass
-class VisualState:
-    emotion: str = "neutral"
-    previous_emotion: str = "neutral"
-    text: str = "Ik ben klaar."
-    level: float = 0.35
-    audio_level: float = 0.0
-    transition: float = 0.0
+WS_LOGGER = logging.getLogger("websockets")
+WS_LOGGER.setLevel(logging.INFO)
 
 
-@dataclass
-class PendingConnection:
-    """Een inkomende client-verbinding die wacht op goedkeuring via het GUI."""
-    client_id: str
-    label: str               # Korte beschrijving (peer-info) voor in het GUI
-    ip: str = ""             # Alleen het IP-adres (zonder poort), voor de allowlist
-    decision: str = "pending"  # "pending" | "accepted" | "rejected"
-    # asyncio.Event wordt in de ws-handler aangemaakt (de gui-thread heeft zijn eigen loop,
-    # dus het event leeft in de server-loop en wordt daar geset).
-    accept_event: object = None
-
-
-@dataclass
-class ButtonRect:
-    """Schermrechthoek van een klikbare knop (pixels, origine links-boven)."""
-    x: int
-    y: int
-    w: int
-    h: int
-    action: str  # "accept", "reject", "always"
-
-
-class ConnectionGate:
-    """Beheert inkomende verbindingen die goedkeuring nodig hebben (draait in de asyncio server-loop).
-
-    Onderhoudt daarnaast een allowlist van IP-adressen (zonder poort) die automatisch
-    worden goedgekeurd, zodat een client die steeds via een andere poort komt na één
-    keer 'ALTIJD' niet opnieuw om goedkeuring hoeft te vragen.
-    """
-
-    def __init__(self, allowlist_path: Path = ALLOWED_IPS_PATH):
-        self._pending: dict[str, PendingConnection] = {}
-        self._lock = threading.Lock()
-        self._allowlist_path = allowlist_path
-        self._allowed_ips: set[str] = self._load_allowed_ips()
-
-    def _load_allowed_ips(self) -> set[str]:
-        try:
-            if self._allowlist_path.exists():
-                data = json.loads(self._allowlist_path.read_text(encoding="utf-8"))
-                if isinstance(data, list):
-                    return {str(item) for item in data}
-        except (OSError, ValueError):
-            pass
-        return set()
-
-    def _save_allowed_ips(self):
-        try:
-            self._allowlist_path.write_text(
-                json.dumps(sorted(self._allowed_ips), indent=2), encoding="utf-8"
-            )
-        except OSError:
-            pass
-
-    def is_allowed(self, ip: str) -> bool:
-        with self._lock:
-            return ip in self._allowed_ips
-
-    def allow_ip(self, ip: str):
-        """Voeg een IP (zonder poort) permanent toe aan de allowlist en sla op."""
-        if not ip:
-            return
-        with self._lock:
-            if ip not in self._allowed_ips:
-                self._allowed_ips.add(ip)
-                self._save_allowed_ips()
-
-    def request(self, label: str, ip: str = "") -> PendingConnection:
-        client_id = uuid.uuid4().hex[:8]
-        conn = PendingConnection(
-            client_id=client_id,
-            label=label,
-            ip=ip,
-            accept_event=asyncio.Event(),
-        )
-        with self._lock:
-            self._pending[client_id] = conn
-        return conn
-
-    def decide(self, accept: bool, always: bool = False) -> PendingConnection | None:
-        """Bepaal de bovenste pending connection (FIFO) en signaleer de wachtende handler.
-
-        Met always=True wordt het IP bovendien permanent vrijgegeven.
-        """
-        with self._lock:
-            if not self._pending:
-                return None
-            client_id = next(iter(self._pending))
-            conn = self._pending[client_id]
-        # Beslissing + event worden in de server-loop geset via decide_async,
-        # maar we zetten de waarde hier thread-safe zodat de render-thread leest.
-        conn.decision = "accepted" if accept else "rejected"
-        if always and accept and conn.ip:
-            self.allow_ip(conn.ip)
-        return conn
-
-    def remove(self, client_id: str):
-        with self._lock:
-            self._pending.pop(client_id, None)
-
-    def snapshot(self) -> list[PendingConnection]:
-        with self._lock:
-            return list(self._pending.values())
-
-
-class SharedState:
-    def __init__(self):
-        self.data = VisualState()
-        self.lock = threading.Lock()
-        self.gate = ConnectionGate()
-        self.server_loop: asyncio.AbstractEventLoop | None = None
-
-    def set_server_loop(self, loop: asyncio.AbstractEventLoop):
-        self.server_loop = loop
-
-    def approve_top_connection(self, accept: bool, always: bool = False) -> bool:
-        """Wordt vanuit de GUI-thread aangeroepen. Bepaalt de bovenste pending
-        connectie en signaleert de wachtende ws-handler in de server-loop.
-
-        Met always=True wordt het IP van deze connectie permanent vrijgegeven
-        (alleen IP, geen poort).
-        """
-        conn = self.gate.decide(accept, always=always)
-        if conn is None or self.server_loop is None:
-            return False
-        event = conn.accept_event
-        if event is not None:
-            self.server_loop.call_soon_threadsafe(event.set)
-        return True
-
-    def set(self, emotion: str, text: str, audio_level: float = 0.0):
-        with self.lock:
-            self.data.previous_emotion = self.data.emotion
-            self.data.emotion = emotion
-            self.data.text = text
-            self.data.level = EMOTION_LEVELS.get(emotion, 0.35)
-            self.data.audio_level = max(0.0, min(1.0, audio_level))
-            self.data.transition = 0.0
-
-    def update_visual(self, emotion: str | None = None, text: str | None = None, audio_level: float | None = None):
-        with self.lock:
-            if emotion and emotion != self.data.emotion:
-                self.data.previous_emotion = self.data.emotion
-                self.data.emotion = emotion
-                self.data.level = EMOTION_LEVELS.get(emotion, self.data.level)
-                self.data.transition = 0.0
-            if text is not None:
-                self.data.text = text
-            if audio_level is not None:
-                self.data.audio_level = max(0.0, min(1.0, audio_level))
-
-    def get(self) -> VisualState:
-        with self.lock:
-            return VisualState(
-                emotion=self.data.emotion,
-                previous_emotion=self.data.previous_emotion,
-                text=self.data.text,
-                level=self.data.level,
-                audio_level=self.data.audio_level,
-                transition=self.data.transition,
-            )
-
-    def step_transition(self, amount: float):
-        with self.lock:
-            self.data.transition = min(1.0, self.data.transition + amount)
-
-
-def detect_emotion(text: str) -> str:
-    lower = text.lower()
-    for emotion, words in EMOTION_KEYWORDS.items():
-        if any(re.search(rf"\b{re.escape(word)}\b", lower) for word in words):
-            return emotion
-    return "neutral"
-
-
-def exact_reply_from_prompt(prompt: str) -> str | None:
-    lower = prompt.lower().strip()
-
-    quoted = re.search(r"[\"']([^\"']{1,80})[\"']", prompt)
-    if "alleen" in lower and quoted:
-        return quoted.group(1).strip()
-
-    match = re.search(
-        r"\bzeg\s+(?:eens|is)?\s*([a-zA-Z0-9!?., -]{1,40}?)\s+alleen\b",
-        prompt,
-        re.IGNORECASE,
-    )
-    if match:
-        return match.group(1).strip(" .,!?")
-
-    match = re.search(
-        r"\balleen\s+([a-zA-Z0-9!?., -]{1,40}?)(?:\s+(?:verder|meer|niks|niets)\b|$)",
-        prompt,
-        re.IGNORECASE,
-    )
-    if match:
-        return match.group(1).strip(" .,!?")
-
-    return None
-
-
-def clean_tool_text(value: str) -> str:
-    return value.strip().strip("\"'` ").replace("\x00", "")
-
-
-def extract_quoted_text(text: str) -> str | None:
-    match = re.search(r"[\"']([^\"']{1,500})[\"']", text)
-    if match:
-        return clean_tool_text(match.group(1))
-    return None
-
-
-def resolve_safe_path(raw_path: str | None, default_name: str = "") -> Path:
-    DEFAULT_WORK_DIR.mkdir(parents=True, exist_ok=True)
-    if not raw_path:
-        target = DEFAULT_WORK_DIR / default_name if default_name else DEFAULT_WORK_DIR
-    else:
-        cleaned = clean_tool_text(raw_path)
-        target = Path(cleaned).expanduser()
-        if not target.is_absolute():
-            target = DEFAULT_WORK_DIR / target
-
-    resolved = target.resolve()
-    allowed_roots = (HOME_DIR.resolve(), PROJECT_DIR.resolve())
-    if not any(resolved == root or root in resolved.parents for root in allowed_roots):
-        raise ValueError(f"Pad buiten veilige map geblokkeerd: {resolved}")
-    return resolved
-
-
-def extract_path_after_keywords(text: str, keywords: tuple[str, ...], default_name: str = "") -> Path:
-    quoted = extract_quoted_text(text)
-    if quoted:
-        return resolve_safe_path(quoted, default_name)
-
-    lower = text.lower()
-    for keyword in keywords:
-        index = lower.find(keyword)
-        if index >= 0:
-            candidate = text[index + len(keyword):].strip(" :.-")
-            if candidate:
-                return resolve_safe_path(candidate, default_name)
-    return resolve_safe_path(None, default_name)
-
-
-def extract_write_target(text: str) -> Path:
-    lower = text.lower()
-    for keyword in ("schrijf bestand", "maak bestand", "zet tekst in bestand"):
-        index = lower.find(keyword)
-        if index >= 0:
-            candidate = text[index + len(keyword):].strip(" :.-")
-            candidate = re.split(r"\bmet tekst\b|\bmet inhoud\b", candidate, maxsplit=1, flags=re.I)[0]
-            candidate = candidate.strip(" :.-\"'")
-            if candidate:
-                return resolve_safe_path(candidate, "notitie.txt")
-    return resolve_safe_path(None, "notitie.txt")
-
-
-def format_command_output(command: list[str], timeout: int = 8) -> str:
-    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
-    output = (result.stdout or result.stderr or "").strip()
-    return output[:1200] or "Geen output."
-
-
-def detect_language_simple(text: str) -> str:
-    """Detecteer taalcode (ISO 639-1) van `text`.
-
-    Als `langdetect` beschikbaar is gebruiken we dat; anders terugvallen
-    op een eenvoudige heuristiek die 'nl' of 'en' teruggeeft.
-    """
-    if not text:
-        return "en"
-    if LANGDETECT_AVAILABLE:
-        try:
-            code = detect(text)
-            # langdetect kan 'nl', 'en', 'fr', etc. teruggeven
-            return code
-        except Exception:
-            pass
-
-    # Fallback heuristiek (vooral voor NL/EN)
-    lower = text.lower()
-    if re.search(r"\bin het nederlands\b|\bnederlands\b|\bin nederlands\b", lower):
-        return "nl"
-    if re.search(r"\bin het engels\b|\benglish\b", lower):
-        return "en"
-
-    dutch_common = [" de ", " het ", " een ", "hoe", "wat", "waar", "waarom", "zoeken", "zoek"]
-    english_common = [" the ", " how ", " what ", " why ", " search ", " find "]
-    dutch_score = sum(1 for w in dutch_common if w in lower)
-    eng_score = sum(1 for w in english_common if w in lower)
-    return "nl" if dutch_score >= eng_score else "en"
-
-
-def is_probably_shell_command(text: str) -> bool:
-    if not text:
-        return False
-    text = text.strip()
-    if len(text) > 200:
-        return False
-    if "\n" in text:
-        return True
-    if re.search(r"[<>|;&$*~`\\]", text):
-        return True
-
-    lower = text.lower()
-    if re.search(r"\b(how|what|hoe|wat|waar|waarom|welke|kun je|kunt u|geef|laat|beschrijf|vertel)\b", lower):
-        return False
-
-    first = text.split()[0]
-    common_bin = {
-        "ls", "cat", "grep", "echo", "pwd", "mkdir", "rm", "cp", "mv", "python", "pip",
-        "uname", "whoami", "df", "du", "top", "htop", "ps", "sudo", "git", "find", "curl",
-        "wget", "service", "systemctl", "bash", "sh",
-    }
-    if first in common_bin or first.startswith(("/", "./")) or first.endswith(".sh"):
-        return True
-
-    if re.search(r"\b(ls|cat|grep|echo|pwd|mkdir|rm|cp|mv|python|pip|uname|whoami|df|du|top|git)\b", text):
-        return True
-
-    return False
-
-
-def extract_shell_command(text: str) -> str | None:
-    """Haal een shell-command uit de gebruikersvraag als die expliciet gevraagd is."""
-    if not text:
-        return None
-    cleaned = re.sub(
-        r"\b(gebruik (de )?(command prompt|terminal)|run (in )?(de )?(command prompt|shell|terminal)|execute (in )?(de )?(shell|command prompt)|shell command|cmd prompt)\b",
-        "",
-        text,
-        flags=re.I,
-    ).strip()
-    if not cleaned:
-        return None
-
-    quoted = re.search(r"[`\"]([^`\"]+)[`\"]", text)
-    if quoted:
-        return quoted.group(1).strip()
-
-    if is_probably_shell_command(cleaned):
-        return cleaned
-    return None
-
-
-def fix_shell_command(command: str, stderr: str, lang: str = "en") -> str | None:
-    language_name = LANG_NAME_MAP.get(lang, lang)
-    prompt = (
-        f"De volgende shell command faalde met een foutmelding:\n{stderr}\n\n"
-        f"Origineel commando: {command}\n"
-        f"Verbeter dit commando zodat het de bedoeling uitvoert, geef alleen het gecorrigeerde commando terug,"
-        f" zonder extra uitleg. Gebruik dezelfde taal ({language_name}) als de gebruiker waar nodig."
-    )
-    ai_response = call_ollama_api("phi3:mini", prompt)
-    if not ai_response:
-        return None
-    corrected = ai_response.strip().splitlines()[0].strip()
-    # Als de AI iets anders dan een plausibel commando teruggeeft, negeer het.
-    if len(corrected) < 3 or any(keyword in corrected.lower() for keyword in ("error", "fout", "sorry", "can't", "kan niet")):
-        return None
-    return corrected
-
-
-def execute_shell_command(command: str, timeout: int = 30) -> str:
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, shell=True)
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
-        if result.returncode != 0:
-            return f"Command returned exit code {result.returncode}.\n{stderr or stdout}"
-        return stdout or stderr or f"Command uitgevoerd met exitcode {result.returncode}, maar zonder output."
-    except subprocess.TimeoutExpired as exc:
-        return f"Command timed out na {timeout} seconden.\n{(exc.stdout or '').strip()}\n{(exc.stderr or '').strip()}"
-    except Exception as exc:
-        return f"Command uitvoeren mislukt: {exc}"
-
-
-def call_ollama_api(model: str, prompt: str, timeout: int = 20) -> str:
-    """Directe (laag-niveau) aanroep naar de Ollama REST API zonder lokale tool checks.
-    Retourneert de tekstuele inhoud of een fallback-bericht bij fouten.
-    """
-    try:
-        payload = {"model": model, "stream": False, "messages": [{"role": "user", "content": prompt}]}
-        resp = requests.post(OLLAMA_API, json=payload, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        msg = data.get("message", {})
-        return (msg.get("content", "") or "").strip() or ""
-    except Exception:
-        return ""
-
-
-def search_online(query: str) -> str:
-    # Detecteer taal van de zoekopdracht zodat we resultaten en samenvattingen
-    # in de juiste taal teruggeven.
-    lang = detect_language_simple(query)
-    kl_value = f"{lang}-{lang}" if len(lang) == 2 else lang
-    headers = {"Accept-Language": lang}
-    params = {
-        "q": query,
-        "format": "json",
-        "no_html": 1,
-        "skip_disambig": 1,
-        # regio/taal hints voor DuckDuckGo
-        "kl": kl_value,
-        "lang": lang,
-    }
-    response = requests.get(
-        "https://api.duckduckgo.com/",
-        params=params,
-        headers=headers,
-        timeout=12,
-    )
-    print(response.url)
-    response.raise_for_status()
-    data = response.json()
-    abstract = data.get("AbstractText") or data.get("Answer") or ""
-    source = data.get("AbstractURL") or ""
-
-    related = []
-    for item in data.get("RelatedTopics", []):
-        if isinstance(item, dict) and item.get("Text"):
-            related.append(item["Text"])
-        if len(related) >= 3:
-            break
-
-    parts = [part for part in [abstract, *related] if part]
-    if not parts:
-        return "Ik kon online niets duidelijks vinden."
-    suffix = f"\nBron: {source}" if source else ""
-    combined = "\n".join(parts)[:2000] + suffix
-
-    # Vraag de AI om een korte samenvatting in de taal van de gebruiker
-    language_name = LANG_NAME_MAP.get(lang, lang)
-    ai_prompt = (
-        f"Geef een korte samenvatting (maximaal twee korte zinnen) in {language_name} van de volgende zoekresultaten:\n{combined}"
-    )
-    ai_summary = call_ollama_api("phi3:mini", ai_prompt)
-    if ai_summary:
-        return ai_summary[:1200]
-    return combined[:1200]
-
-
-def set_system_volume(percent: int) -> str:
-    percent = max(0, min(100, percent))
-    mixers = [
-        ["amixer", "sset", "Master", f"{percent}%"],
-        ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{percent}%"],
-    ]
-    for command in mixers:
-        if shutil.which(command[0]):
-            format_command_output(command)
-            return f"Volume ingesteld op {percent}%."
-    return "Ik kon geen ondersteunde volume-tool vinden op deze Pi."
-
-
-def run_pi_tool(user_text: str) -> str | None:
-    lower = user_text.lower()
-
-    if any(word in lower for word in ("zoek online", "zoek op internet", "google", "online opzoeken", "internet")):
-        query = re.sub(r"\b(zoek online|zoek op internet|google|online opzoeken|internet)\b", "", user_text, flags=re.I)
-        query = clean_tool_text(query) or user_text
-        results = search_online(query)
-        # Gebruik AI om resultaten samen te vatten in de taal van de gebruiker
-        lang = detect_language_simple(user_text)
-        language_name = LANG_NAME_MAP.get(lang, lang)
-        ai_prompt = (
-            f"Je bent een hulpvaardige assistent. Geef een korte samenvatting (max twee zinnen) in {language_name} "
-            f"van deze zoekresultaten voor de gebruiker:\n{results}"
-        )
-        ai_summary = call_ollama_api("phi3:mini", ai_prompt)
-        return ai_summary or results
-
-    if any(word in lower for word in ("temperatuur", "cpu temp", "cpu temperatuur")):
-        temp = read_cpu_temperature()
-        return "CPU temperatuur onbekend." if temp is None else f"CPU temperatuur is {temp:.1f} C."
-    
-    if any(word in lower for word in ("gpu temp", "gpu temperatuur")):
-        temp = read_gpu_temperature()
-        return "GPU temperatuur onbekend." if temp is None else f"GPU temperatuur is {temp:.1f} C."
-
-    if any(word in lower for word in ("gpu usage", "gpu gebruik")):
-        usage = read_gpu_usage()
-        return "GPU gebruik onbekend." if usage is None else f"GPU gebruik is {usage:.1f}%."
-
-    if any(word in lower for word in ("status", "systeem info", "pi info", "schijfruimte", "opslag")):
-        uptime = format_command_output(["uptime"]) if shutil.which("uptime") else "uptime onbekend"
-        disk = format_command_output(["df", "-h", str(HOME_DIR)]) if shutil.which("df") else "schijf onbekend"
-        return f"Pi status:\n{uptime}\n\nOpslag:\n{disk}"
-
-    if any(word in lower for word in ("ip adres", "ip-adres", "netwerk info")):
-        if shutil.which("hostname"):
-            return format_command_output(["hostname", "-I"])
-        return "Ik kon het IP-adres niet ophalen."
-
-    if "volume" in lower:
-        match = re.search(r"(\d{1,3})\s*%?", lower)
-        if match:
-            return set_system_volume(int(match.group(1)))
-        return "Zeg bijvoorbeeld: zet volume naar 50 procent."
-
-    if any(word in lower for word in ("maak map", "maak een map", "nieuwe map", "map aan")):
-        path = extract_path_after_keywords(user_text, ("maak een map", "maak map", "nieuwe map", "map aan"), "nieuwe_map")
-        path.mkdir(parents=True, exist_ok=True)
-        # Laat de AI een korte bevestiging of extra instructies geven
-        lang = detect_language_simple(user_text)
-        language_name = LANG_NAME_MAP.get(lang, lang)
-        ai_prompt = (
-            f"Bevestig kort in {language_name} dat de map is aangemaakt en geef één voorbeeldzin hoe de gebruiker ernaartoe kan navigeren: {path}"
-        )
-        ai_resp = call_ollama_api("phi3:mini", ai_prompt)
-        return ai_resp or f"Map aangemaakt: {path}"
-
-    if any(word in lower for word in ("lijst map", "toon map", "laat map zien", "wat staat er in")):
-        path = extract_path_after_keywords(user_text, ("lijst map", "toon map", "laat map zien", "wat staat er in"), "")
-        if not path.exists() or not path.is_dir():
-            return f"Map bestaat niet: {path}"
-        items = sorted(item.name + ("/" if item.is_dir() else "") for item in path.iterdir())
-        listing = "Map is leeg." if not items else "\n".join(items[:80])
-        lang = detect_language_simple(user_text)
-        language_name = LANG_NAME_MAP.get(lang, lang)
-        ai_prompt = f"Geef een korte, vriendelijke samenvatting in {language_name} van de inhoud van deze map:\n{listing}"
-        ai_resp = call_ollama_api("phi3:mini", ai_prompt)
-        return ai_resp or listing
-
-    if any(word in lower for word in ("lees bestand", "toon bestand", "open bestand")):
-        path = extract_path_after_keywords(user_text, ("lees bestand", "toon bestand", "open bestand"), "")
-        if not path.exists() or not path.is_file():
-            return f"Bestand bestaat niet: {path}"
-        content = path.read_text(encoding="utf-8", errors="replace")[:2000]
-        lang = detect_language_simple(user_text)
-        language_name = LANG_NAME_MAP.get(lang, lang)
-        ai_prompt = f"Vat kort samen in {language_name} wat er in het volgende bestand staat (max twee zinnen):\n{content}"
-        ai_resp = call_ollama_api("phi3:mini", ai_prompt)
-        return ai_resp or content
-
-    if any(word in lower for word in ("schrijf bestand", "maak bestand", "zet tekst in bestand")):
-        path = extract_write_target(user_text)
-        content = extract_quoted_text(user_text) or "Aangemaakt door Jarvis."
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        lang = detect_language_simple(user_text)
-        language_name = LANG_NAME_MAP.get(lang, lang)
-        ai_prompt = f"Bevestig kort in {language_name} dat het bestand is opgeslagen: {path}"
-        ai_resp = call_ollama_api("phi3:mini", ai_prompt)
-        return ai_resp or f"Bestand opgeslagen: {path}"
-
-    if any(word in lower for word in ("verwijder bestand", "delete bestand")):
-        path = extract_path_after_keywords(user_text, ("verwijder bestand", "delete bestand"), "")
-        if not path.exists() or not path.is_file():
-            return f"Bestand bestaat niet: {path}"
-        trash_dir = DEFAULT_WORK_DIR / ".trash"
-        trash_dir.mkdir(parents=True, exist_ok=True)
-        destination = trash_dir / f"{int(time.time())}_{path.name}"
-        shutil.move(str(path), str(destination))
-        lang = detect_language_simple(user_text)
-        language_name = LANG_NAME_MAP.get(lang, lang)
-        ai_prompt = f"Bevestig kort in {language_name} dat het bestand is verplaatst naar de prullenbak: {destination}"
-        ai_resp = call_ollama_api("phi3:mini", ai_prompt)
-        return ai_resp or f"Bestand verplaatst naar prullenbak: {destination}"
-
-    command_text = extract_shell_command(user_text)
-    if command_text:
-        response = execute_shell_command(command_text)
-        if "Command returned exit code" in response or "Command timed out" in response or "Command uitvoeren mislukt" in response:
-            lang = detect_language_simple(user_text)
-            fixed = fix_shell_command(command_text, response, lang=lang)
-            if fixed and fixed != command_text:
-                follow_up = execute_shell_command(fixed)
-                return f"Fout gedetecteerd. Probeer gecorrigeerd commando:\n{fixed}\n\nUitkomst:\n{follow_up}"
-        return response
-
-    if any(word in lower for word in ("herstart ollama", "restart ollama")):
-        if shutil.which("systemctl"):
-            return format_command_output(["systemctl", "restart", "ollama"])
-        return "systemctl is niet beschikbaar."
-
-    return None
-
-def ask_ollama(model: str, prompt: str, max_retries: int = 3) -> str:
-    """
-    Roept Ollama aan. Als het antwoord leeg is, probeert het opnieuw tot max_retries.
-    Elke poging heeft een timeout van 60 seconden.
-    """
-    exact_reply = exact_reply_from_prompt(prompt)
-    if exact_reply:
-        return exact_reply
-
-    tool_reply = run_pi_tool(prompt)
-    if tool_reply:
-        return tool_reply
-
-    system_msg = (
-        "Je bent een korte assistent die beknopt antwoord geeft. "
-        "Antwoord in het Nederlands als de gebruiker Nederlands gebruikt, anders in het Engels. "
-        "Geef maximaal twee korte zinnen. Reageer niet met code tenzij expliciet gevraagd."
-    )
-    ai_prompt = system_msg + "\n\nGebruikersvraag: " + prompt
-    
-    retry_count = 0
-    
-    while retry_count < max_retries:
-        try:
-            # Probeer de API aan te roepen met een timeout van 60 seconden
-            # Als de API langer dan 60s duurt, gooit hij een TimeoutError
-            ai_resp = call_ollama_api(model, ai_prompt, timeout=60)
-            
-            # Controleer of het antwoord niet leeg is
-            if ai_resp and ai_resp.strip():
-                return ai_resp
-            
-            # Als we hier zijn, was het antwoord leeg of None
-            print(f"Poging {retry_count + 1} gaf leeg antwoord. Proberen opnieuw...")
-            
-        except Exception as e:
-            # Als er een error is (bijv. Timeout na 60s)
-            print(f"Poging {retry_count + 1} mislukt: {e}. Proberen opnieuw...")
-            ai_resp = None
-
-        retry_count += 1
-        
-        # Wacht kort tussen pogingen (optioneel, bijv. 2 seconden)
-        if retry_count < max_retries:
-            time.sleep(2)
-
-    # Als we alle pogingen hebben opgemaakt en niets gekregen:
-    return "Ik heb even geen antwoord."
-
-
-async def ask_ollama_async(model: str, prompt: str) -> str:
-    return await asyncio.to_thread(ask_ollama, model, prompt)
-
-
-def _get_peer_ip(peer) -> tuple[str, str]:
-    """Retourneert (ip, label) uit een remote_address tuple. Label bevat ip:port."""
-    if peer and isinstance(peer, (list, tuple)) and len(peer) >= 2:
+def _get_peer_ip(peer) -> tuple[str | None, str]:
+    if peer is None:
+        return None, "onbekend"
+    if isinstance(peer, tuple):
         ip = str(peer[0])
-        port = str(peer[1])
-        return ip, f"{ip}:{port}"
-    return "", "onbekend"
+        return ip, ip
+    return str(peer), str(peer)
 
-def is_tailscale_ip(ip_address: str) -> bool:
-    """Controleer of een IP-adres in de Tailscale-range valt (100.x.x.x)."""
+
+def is_tailscale_ip(ip: str) -> bool:
+    """Check of IP in de Tailscale range zit (100.64.0.0/10)."""
+    if not ip: return False
+    parts = ip.split('.')
+    if len(parts) != 4: return False
     try:
-        parts = str(ip_address).split(".")
-        return len(parts) == 4 and parts[0] == "100"
-    except Exception:
+        a, b = int(parts[0]), int(parts[1])
+        return a == 100 and (64 <= b <= 127)
+    except ValueError:
         return False
+
+
+def detect_tailscale_ip() -> str | None:
+    """Probeert het Tailscale IP van deze Pi te vinden."""
+    try:
+        # Gebruik de 'tailscale ip' command line tool
+        output = subprocess.check_output(["tailscale", "ip", "-4"], text=True, timeout=2).strip()
+        if output: return output
+    except:
+        pass
+
+    # Fallback: scan interfaces
+    try:
+        import socket
+        import fcntl
+        import struct
+
+        def get_ip_address(ifname):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            return socket.inet_ntoa(fcntl.ioctl(
+                s.fileno(),
+                0x8915,  # SIOCGIFADDR
+                struct.pack('256s', ifname[:15].encode('utf-8'))
+            )[20:24])
+
+        for iface in ["tailscale0", "ts0"]:
+            try:
+                ip = get_ip_address(iface)
+                if ip: return ip
+            except: continue
+    except:
+        pass
+    return None
 
 
 def check_tailscale_status() -> dict:
-    """Gedetailleerde Tailscale status check voor debugging.
-    Retourneert een dict met status-info die in de logs wordt geprint.
-    """
+    """Controleert of Tailscale correct draait en verbonden is."""
     status = {
         "installed": False,
         "running": False,
-        "ip": "",
-        "hostname": "",
         "connected": False,
-        "errors": [],
+        "ip": None,
+        "hostname": None,
+        "errors": []
     }
 
-    # 1. Is tailscale geïnstalleerd?
-    ts_bin = shutil.which("tailscale")
-    tailscaled_bin = shutil.which("tailscaled")
-    status["installed"] = bool(ts_bin or tailscaled_bin)
-
-    if not status["installed"]:
-        status["errors"].append("Tailscale niet gevonden in PATH — installeer via 'curl -fsSL https://tailscale.com/install.sh | sh'")
+    # Check if tailscale is installed
+    if shutil.which("tailscale"):
+        status["installed"] = True
+    else:
+        status["errors"].append("Tailscale niet gevonden in PATH")
         return status
 
-    # 2. Is tailscaled actief?
-    if shutil.which("systemctl"):
-        try:
-            result = subprocess.run(
-                ["systemctl", "is-active", "tailscaled"],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            status["running"] = result.stdout.strip() == "active"
-            if not status["running"]:
-                status["errors"].append(f"tailscaled service is niet actief (status: {result.stdout.strip()})")
-                status["errors"].append("Start met: sudo systemctl start tailscaled && sudo systemctl enable tailscaled")
-        except Exception as exc:
-            status["errors"].append(f"Kon tailscaled status niet checken: {exc}")
-
-    # 3. Tailscale IP ophalen
     try:
-        result = subprocess.run(
-            ["tailscale", "ip", "-4"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            status["ip"] = result.stdout.strip()
-        elif result.stderr:
-            status["errors"].append(f"tailscale ip -4 error: {result.stderr.strip()}")
-    except Exception as exc:
-        status["errors"].append(f"tailscale ip -4 faalde: {exc}")
-
-    # 4. Tailscale status (verbonden met netwerk?)
-    try:
-        result = subprocess.run(
-            ["tailscale", "status", "--json"],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            import json as _json
-            ts_data = _json.loads(result.stdout)
-            status["connected"] = ts_data.get("BackendState") == "Running"
-            status["hostname"] = ts_data.get("Self", {}).get("HostName", "")
-            if not status["connected"]:
-                backend = ts_data.get("BackendState", "unknown")
-                status["errors"].append(f"Tailscale backend state: {backend} — niet verbonden met Tailscale netwerk")
-                status["errors"].append("Controleer: tailscale up --accept-routes")
-    except Exception as exc:
-        status["errors"].append(f"tailscale status faalde: {exc}")
-
-    # 5. Controleer of poort 8765 bereikbaar is via Tailscale interface
-    if status["ip"]:
-        try:
-            result = subprocess.run(
-                ["ss", "-tlnp"],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            if ":8765" in result.stdout:
-                pass  # poort luistert
-            else:
-                status["errors"].append("Poort 8765 lijkt niet te luisteren op een van de interfaces (geen match in 'ss -tlnp')")
-        except Exception:
-            pass
+        # Check if tailscaled daemon is running
+        output = subprocess.check_output(["tailscale", "status", "--json"], text=True, timeout=3)
+        data = json.loads(output)
+        status["running"] = True
+        status["connected"] = (data.get("BackendState") == "Running")
+        status["ip"] = data.get("Self", {}).get("TailscaleIPs", [None])[0]
+        status["hostname"] = data.get("Self", {}).get("HostName")
+    except Exception as e:
+        status["errors"].append(f"Fout bij status check: {e}")
 
     return status
 
-
-def detect_tailscale_ip() -> str:
-    """Probeer het Tailscale IPv4-adres (100.x.x.x) van de Pi te vinden.
-
-    Probeert achtereenvolgens:
-      1. 'tailscale ip -4' commando
-      2. Alle netwerkinterfaces scannen op 100.x.x.x adres
-    """
-    # Methode 1: tailscale CLI
-    if shutil.which("tailscale"):
-        try:
-            result = subprocess.run(
-                ["tailscale", "ip", "-4"],
-                capture_output=True, text=True, timeout=5, check=False,
-            )
-            ip = (result.stdout or "").strip()
-            if ip and ip.startswith("100."):
-                return ip
-        except Exception:
-            pass
-
-    # Methode 2: scan netwerkinterfaces
+def save_chat_history_entry(chat_message: dict):
+    """Sla een bericht op in de server-side geschiedenis."""
     try:
-        result = subprocess.run(
-            ["hostname", "-I"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-        for token in (result.stdout or "").split():
-            token = token.strip()
-            if token.startswith("100."):
-                return token
-    except Exception:
-        pass
+        chat_history_file = PROJECT_DIR / "server_chat_history.json"
+        chat_history = []
+        if chat_history_file.exists():
+            try:
+                with open(chat_history_file, 'r', encoding='utf-8') as f:
+                    chat_history = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
 
-    return ""
+        chat_history.append(chat_message)
+
+        # Houd alleen de laatste 100 berichten
+        if len(chat_history) > 100:
+            chat_history = chat_history[-100:]
+
+        with open(chat_history_file, 'w', encoding='utf-8') as f:
+            json.dump(chat_history, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Kon chatgeschiedenis niet opslaan: {e}")
+
+
+def get_server_sync_payload(status="accepted", client_id=None, peer_label=None):
+    """Genereer de volledige payload voor client synchronisatie."""
+    chat_history = []
+    try:
+        history_file = PROJECT_DIR / "server_chat_history.json"
+        if history_file.exists():
+            with open(history_file, 'r', encoding='utf-8') as f:
+                chat_history = json.load(f)
+    except: pass
+
+    voice_profiles = {}
+    try:
+        vp_file = PROJECT_DIR / "server_voice_profiles.json"
+        if vp_file.exists():
+            with open(vp_file, 'r', encoding='utf-8') as f:
+                voice_profiles = json.load(f)
+    except: pass
+
+    speaker_perms = {}
+    try:
+        sp_file = PROJECT_DIR / "server_roles.json"
+        if sp_file.exists():
+            with open(sp_file, 'r', encoding='utf-8') as f:
+                speaker_perms = json.load(f)
+    except: pass
+
+    server_settings = {}
+    try:
+        settings_file = PROJECT_DIR / "server_settings.json"
+        if settings_file.exists():
+            with open(settings_file, 'r', encoding='utf-8') as f:
+                server_settings = json.load(f)
+    except: pass
+
+    payload = {
+        "status": status,
+        "chat_history": chat_history[-50:], # Laatste 50 berichten
+        "chat_history_count": len(chat_history),
+        "voice_profiles": voice_profiles,
+        "speaker_permissions": speaker_perms,
+        "settings": server_settings
+    }
+
+    if client_id is not None: payload["client_id"] = client_id
+    if peer_label is not None: payload["peer"] = peer_label
+
+    return payload
 
 
 async def ws_handler(websocket, shared_state: SharedState, default_model: str):
@@ -986,29 +629,24 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
         peer = None
     peer_ip, peer_label = _get_peer_ip(peer)
 
-    # Auto-accept Tailscale clients (100.x.x.x) so mobile clients on Tailscale connect without GUI approval
+    # Auto-accept Tailscale clients (100.x.x.x)
     if peer_ip and is_tailscale_ip(peer_ip):
         conn = shared_state.gate.request(peer_label, ip=peer_ip)
         print(f"Auto-accept (tailscale): {peer_label} (id={conn.client_id})")
         shared_state.update_visual(text=f"Verbonden (tailscale) {peer_label}", audio_level=0.0)
         try:
-            await websocket.send(json.dumps({
-                "status": "accepted",
-                "client_id": conn.client_id,
-                "peer": peer_label,
-            }))
+            payload = get_server_sync_payload("accepted", conn.client_id, peer_label)
+            await websocket.send(json.dumps(payload))
         finally:
             shared_state.gate.remove(conn.client_id)
+    # Auto-accept allowlist
     elif peer_ip and shared_state.gate.is_allowed(peer_ip):
         conn = shared_state.gate.request(peer_label, ip=peer_ip)
         print(f"Auto-accept (allowlist): {peer_label} (id={conn.client_id})")
         shared_state.update_visual(text=f"Verbonden (auto) {peer_label}", audio_level=0.0)
         try:
-            await websocket.send(json.dumps({
-                "status": "accepted",
-                "client_id": conn.client_id,
-                "peer": peer_label,
-            }))
+            payload = get_server_sync_payload("accepted", conn.client_id, peer_label)
+            await websocket.send(json.dumps(payload))
         finally:
             shared_state.gate.remove(conn.client_id)
     else:
@@ -1028,7 +666,8 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
                 conn.decision = "rejected"
 
             if conn.decision == "accepted":
-                await websocket.send(json.dumps({"status": "accepted", "client_id": conn.client_id}))
+                payload = get_server_sync_payload("accepted", conn.client_id, peer_label)
+                await websocket.send(json.dumps(payload))
                 print(f"Verbinding goedgekeurd: {peer_label} (id={conn.client_id})")
                 shared_state.update_visual(text=f"Verbonden met {peer_label}", audio_level=0.0)
             else:
@@ -1051,23 +690,89 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
             )
             continue
 
+        if message_type in {"analyze_screen", "analyze_image"} or data.get("image_base64"):
+            image_base64 = data.get("image_base64", "")
+            # Fix: Check zowel 'question' als 'text' (sommige clients sturen 'text')
+            question = data.get("question") or data.get("text", "")
+            section = data.get("section", "full")
+            model = data.get("model", DEFAULT_VISION_MODEL)
+            think = data.get("think", False)
+
+            if not model or model == default_model:
+                model = DEFAULT_VISION_MODEL
+
+            # Als 'think' uit staat, forceer een snellere verwerking indien mogelijk
+            # (Bij vision modellen is dit vaak beperkter dan bij tekstmodellen)
+
+            shared_state.update_visual(text="Afbeelding analyseren...", audio_level=0.0, active_model=model)
+            try:
+                # Sla vraag op in geschiedenis
+                save_chat_history_entry({
+                    "message": question or "Afbeelding geüpload",
+                    "is_user": True,
+                    "timestamp": datetime.now().isoformat()
+                })
+
+                answer, emotion = await analyze_screen_capture(
+                    image_base64,
+                    question=question,
+                    section=section,
+                    model=model,
+                )
+
+                # Sla antwoord op in geschiedenis
+                save_chat_history_entry({
+                    "message": answer,
+                    "is_user": False,
+                    "timestamp": datetime.now().isoformat()
+                })
+            finally:
+                shared_state.update_visual(active_model=None)
+            shared_state.set(emotion, answer, 0.0)
+            await websocket.send(json.dumps({
+                "reply": answer,
+                "emotion": emotion,
+                "source": "screen",
+                "section": section,
+            }))
+            continue
+
+        if message_type == "ssh_command":
+            # Client vraagt toestemming voor commando-uitvoering op de CLIENT-zijde
+            cmd = data.get("command", "")
+            print(f"SSH commando verzoek ontvangen: {cmd}")
+            # Voor nu sturen we altijd toestemming terug naar de laptop-client
+            await websocket.send(json.dumps({
+                "type": "ssh_execute",
+                "command": cmd
+            }))
+            continue
+
+        if message_type == "ssh_response":
+            # Laptop heeft commando uitgevoerd en stuurt output terug naar server
+            output = data.get("output", "")
+            cmd = data.get("command", "")
+            print(f"SSH output voor '{cmd}':\n{output}")
+            shared_state.update_visual(text=f"SSH gereed: {cmd}", audio_level=0.0)
+            continue
+
         # Voice profile sync endpoints
         if message_type == "upload_voice_profile":
-            voice_data = data.get("voice_data")
             voice_name = data.get("voice_name")
+            voice_data = data.get("voice_data")
             try:
                 # Sla voice profile op in server storage
                 voice_profiles_file = PROJECT_DIR / "server_voice_profiles.json"
                 voice_profiles = {}
                 if voice_profiles_file.exists():
-                    with open(voice_profiles_file, 'r') as f:
+                    with open(voice_profiles_file, 'r', encoding='utf-8') as f:
                         voice_profiles = json.load(f)
 
                 # Update of voeg voice profile toe
                 voice_profiles[voice_name] = voice_data
 
                 # Save naar file
-                with open(voice_profiles_file, 'w') as f:
+                with open(voice_profiles_file, 'w', encoding='utf-8') as f:
                     json.dump(voice_profiles, f, indent=2)
 
                 await websocket.send(json.dumps({"type": "voice_profile_upload_success", "voice_name": voice_name}))
@@ -1081,7 +786,7 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
             try:
                 voice_profiles_file = PROJECT_DIR / "server_voice_profiles.json"
                 if voice_profiles_file.exists():
-                    with open(voice_profiles_file, 'r') as f:
+                    with open(voice_profiles_file, 'r', encoding='utf-8') as f:
                         voice_profiles = json.load(f)
 
                     if voice_name in voice_profiles:
@@ -1105,7 +810,7 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
             try:
                 voice_profiles_file = PROJECT_DIR / "server_voice_profiles.json"
                 if voice_profiles_file.exists():
-                    with open(voice_profiles_file, 'r') as f:
+                    with open(voice_profiles_file, 'r', encoding='utf-8') as f:
                         voice_profiles = json.load(f)
 
                     voice_names = list(voice_profiles.keys())
@@ -1129,7 +834,7 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
             settings_data = data.get("settings_data")
             try:
                 settings_file = PROJECT_DIR / "server_settings.json"
-                with open(settings_file, 'w') as f:
+                with open(settings_file, 'w', encoding='utf-8') as f:
                     json.dump(settings_data, f, indent=2)
                 await websocket.send(json.dumps({"type": "settings_upload_success"}))
                 continue
@@ -1141,7 +846,7 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
             try:
                 settings_file = PROJECT_DIR / "server_settings.json"
                 if settings_file.exists():
-                    with open(settings_file, 'r') as f:
+                    with open(settings_file, 'r', encoding='utf-8') as f:
                         settings_data = json.load(f)
                     # Voeg gedetecteerde Tailscale IP toe zodat clients (Android/iPhone)
                     # automatisch de VPN-host kunnen gebruiken wanneer beschikbaar.
@@ -1149,9 +854,9 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
                         ts_ip = detect_tailscale_ip()
                         if ts_ip:
                             if isinstance(settings_data, dict):
-                                conn = settings_data.get("connection") if settings_data.get("connection") else {}
-                                conn["tailscale_host"] = ts_ip
-                                settings_data["connection"] = conn
+                                conn_data = settings_data.get("connection") if settings_data.get("connection") else {}
+                                conn_data["tailscale_host"] = ts_ip
+                                settings_data["connection"] = conn_data
                             print(f"📡 Added tailscale_host to settings: {ts_ip}")
                     except Exception as _:
                         pass
@@ -1173,7 +878,7 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
             roles_data = data.get("roles_data")
             try:
                 roles_file = PROJECT_DIR / "server_roles.json"
-                with open(roles_file, 'w') as f:
+                with open(roles_file, 'w', encoding='utf-8') as f:
                     json.dump(roles_data, f, indent=2)
                 await websocket.send(json.dumps({"type": "roles_upload_success"}))
                 continue
@@ -1185,7 +890,7 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
             try:
                 roles_file = PROJECT_DIR / "server_roles.json"
                 if roles_file.exists():
-                    with open(roles_file, 'r') as f:
+                    with open(roles_file, 'r', encoding='utf-8') as f:
                         roles_data = json.load(f)
                     await websocket.send(json.dumps({
                         "type": "roles_data",
@@ -1203,20 +908,7 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
         if message_type == "upload_chat_message":
             chat_message = data.get("chat_message")
             try:
-                chat_history_file = PROJECT_DIR / "server_chat_history.json"
-                chat_history = []
-                if chat_history_file.exists():
-                    with open(chat_history_file, 'r') as f:
-                        chat_history = json.load(f)
-
-                chat_history.append(chat_message)
-
-                # Keep only last 100 messages
-                if len(chat_history) > 100:
-                    chat_history = chat_history[-100:]
-
-                with open(chat_history_file, 'w') as f:
-                    json.dump(chat_history, f, indent=2)
+                save_chat_history_entry(chat_message)
                 await websocket.send(json.dumps({"type": "chat_message_upload_success"}))
                 continue
             except Exception as exc:
@@ -1227,7 +919,7 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
             try:
                 chat_history_file = PROJECT_DIR / "server_chat_history.json"
                 if chat_history_file.exists():
-                    with open(chat_history_file, 'r') as f:
+                    with open(chat_history_file, 'r', encoding='utf-8') as f:
                         chat_history = json.load(f)
                     await websocket.send(json.dumps({
                         "type": "chat_history_data",
@@ -1249,12 +941,37 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
             await websocket.send(json.dumps({"error": "Lege tekst ontvangen"}))
             continue
 
+        # Gebruik het door de client gevraagde model.
         model = data.get("model", default_model)
+        think = data.get("think", False)
+
+        # Als 'think' uit staat (snelle modus), gebruik qwen3:8b (de algemene default)
+        # in plaats van het geforceerde coder model. Dit zorgt dat qwen3:8b
+        # ook werkt zonder de vertraging van eventuele 'thinking' parameters.
+        if not think and not data.get("model"):
+            model = DEFAULT_GENERAL_MODEL
+
+        # Sla gebruikersbericht op in geschiedenis
+        save_chat_history_entry({
+            "message": user_text,
+            "is_user": True,
+            "timestamp": datetime.now().isoformat()
+        })
+
         try:
-            shared_state.update_visual(text="AI denkt na...", audio_level=0.0)
+            shared_state.update_visual(text="AI denkt na...", audio_level=0.0, active_model=model)
             answer = await ask_ollama_async(model, user_text)
         except Exception as exc:
             answer = f"Ollama fout: {exc}"
+        finally:
+            shared_state.update_visual(active_model=None)
+
+        # Sla AI antwoord op in geschiedenis
+        save_chat_history_entry({
+            "message": answer,
+            "is_user": False,
+            "timestamp": datetime.now().isoformat()
+        })
 
         emotion = detect_emotion(answer)
         shared_state.set(emotion, answer, 0.0)
@@ -1268,42 +985,44 @@ async def start_server(host: str, port: int, shared_state: SharedState, default_
     shared_state.update_visual(text=f"Websocket start op {host}:{port}{ts_info}", audio_level=0.0)
     print(f"Websocket server starten op {host}:{port}{ts_info}")
 
-    # Gedetailleerde Tailscale status bij opstarten (voor debugging)
-    print("=" * 60)
-    print("TAILSCALE STATUS CHECK")
-    print("=" * 60)
-    ts_status = check_tailscale_status()
-    print(f"  Geïnstalleerd: {ts_status['installed']}")
-    print(f"  tailscaled actief: {ts_status['running']}")
-    print(f"  Tailscale IP: {ts_status['ip'] or '(niet gevonden)'}")
-    print(f"  Hostname: {ts_status['hostname'] or '(onbekend)'}")
-    print(f"  Verbonden met netwerk: {ts_status['connected']}")
-    if ts_status["errors"]:
-        print("  ⚠️  Problemen:")
-        for err in ts_status["errors"]:
-            print(f"     - {err}")
-    else:
-        print("  ✅ Alles lijkt OK")
-    print("=" * 60)
-    if not ts_status["ip"]:
-        print("💡 Tailscale installeren/opstarten:")
-        print("   sudo apt update && curl -fsSL https://tailscale.com/install.sh | sh")
-        print("   sudo systemctl enable --now tailscaled")
-        print("   sudo tailscale up --accept-routes")
-        print("=" * 60)
-
     async with websockets.serve(
-        lambda ws: ws_handler(ws, shared_state, default_model),
-        host,
-        port,
-        logger=WS_LOGGER,
-        ping_interval=20,
-        ping_timeout=120,
+            lambda ws: ws_handler(ws, shared_state, default_model),
+            host,
+            port,
+            logger=WS_LOGGER,
+            ping_interval=20,
+            ping_timeout=120,
+            max_size=20 * 1024 * 1024,  # 20MB — standaard is 1MB, te klein voor foto's/afbeeldingen
     ):
         shared_state.update_visual(text=f"Websocket klaar op {host}:{port}{ts_info}", audio_level=0.0)
         print(f"Websocket server klaar op {host}:{port}{ts_info}")
         # Luister op alle interfaces — dit is essentieel voor Tailscale (100.x.x.x)
         print(f"Server luistert op host={host} (0.0.0.0 = alle interfaces inclusief Tailscale)")
+        def _print_tailscale_status():
+            print("=" * 60)
+            print("TAILSCALE STATUS CHECK")
+            print("=" * 60)
+            ts_status = check_tailscale_status()
+            print(f"  Geïnstalleerd: {ts_status['installed']}")
+            print(f"  tailscaled actief: {ts_status['running']}")
+            print(f"  Tailscale IP: {ts_status['ip'] or '(niet gevonden)'}")
+            print(f"  Hostname: {ts_status['hostname'] or '(onbekend)'}")
+            print(f"  Verbonden met netwerk: {ts_status['connected']}")
+            if ts_status["errors"]:
+                print("  ⚠️  Problemen:")
+                for err in ts_status["errors"]:
+                    print(f"     - {err}")
+            else:
+                print("  ✅ Alles lijkt OK")
+            print("=" * 60)
+            if not ts_status["ip"]:
+                print("💡 Tailscale installeren/opstarten:")
+                print("   sudo apt update && curl -fsSL https://tailscale.com/install.sh | sh")
+                print("   sudo systemctl enable --now tailscaled")
+                print("   sudo tailscale up --accept-routes")
+                print("=" * 60)
+
+        threading.Thread(target=_print_tailscale_status, daemon=True).start()
         await asyncio.Future()
 
 
@@ -1353,21 +1072,21 @@ def read_cpu_temperature() -> float | None:
         return int(raw_value) / 1000.0
     except (OSError, ValueError):
         return None
-    
+
 
 _LAST_GPU_NS = 0
 _LAST_FRAME_TIME = 0
 
 def read_gpu_usage() -> float | None:
     """Berekent de GPU-belasting direct tussen GUI-frames door zonder de GUI te vertragen.
-    
+
     Geeft altijd een float terug (bijv. 0.0 tot 100.0) of None bij rechtenproblemen.
     """
     global _LAST_GPU_NS, _LAST_FRAME_TIME
 
     current_gpu_ns = 0
 
-    # Scan alle actieve DRM engines
+    # scan alle actieve DRM engines
     for fd_path in glob.glob("/proc/[0-9]*/fdinfo/[0-9]*"):
         try:
             with open(fd_path, "r") as f:
@@ -1375,12 +1094,7 @@ def read_gpu_usage() -> float | None:
                 if "drm-engine-" in content:
                     for line in content.splitlines():
                         if "drm-engine-" in line:
-                            # OPLOSSING: Haal ALLE cijfers uit de regel, niet alleen het laatste woord.
-                            # Voorbeeld regel: "drm-engine-render:      1157436344 ns"
-                            # filter haalt alleen de cijfers eruit: "1157436344"
                             clean_num = "".join(filter(str.isdigit, line))
-                            
-                            # Als er een getal in de regel staat (en het is niet leeg)
                             if clean_num:
                                 current_gpu_ns += int(clean_num)
         except (PermissionError, FileNotFoundError):
@@ -1393,7 +1107,7 @@ def read_gpu_usage() -> float | None:
         _LAST_GPU_NS = current_gpu_ns
         _LAST_FRAME_TIME = current_time
         return 0.01  # Klein getal om GUI te activeren
-    
+
     # Bereken het verschil met de vorige frame
     gpu_diff = current_gpu_ns - _LAST_GPU_NS
     time_diff = current_time - _LAST_FRAME_TIME
@@ -1405,14 +1119,12 @@ def read_gpu_usage() -> float | None:
     # Sla huidige waarden op voor de volgende frame
     _LAST_GPU_NS = current_gpu_ns
     _LAST_FRAME_TIME = current_time
-    
+
     # Berekening: (verschil in ns) / (verschil in tijd) * 100
-    # Let op: dit geeft een percentage van de totale CPU-tijd die aan GPU is besteed
-    # Als dit >100% is (meerdere kernen), wordt het afgekapt op 100.
     percentage = (gpu_diff / time_diff) * 100.0 / 2.3
-    
-    # Debug output (optioneel, kan je later verwijderen)
-    # print(f"GPU Usage: {percentage:.2f}% (diff: {gpu_diff}, time: {time_diff})")
+
+    if any("v3d" in fd_path for fd_path in glob.glob("/proc/[0-9]*/fdinfo/[0-9]*")):
+        percentage *= 1.5
 
     return min(percentage, 100.0)
 
@@ -1487,7 +1199,6 @@ def read_cpu_usage() -> float | None:
             int(cpu_parts[1]), int(cpu_parts[2]),
             int(cpu_parts[3]), int(cpu_parts[4]),
         )
-        # Iowait en meer velden negeren we voor eenvoud; dat is nauwkeurig genoeg.
         total = user + nice + system + idle
         diff_idle = idle - _prev_cpu_idle[_prev_cpu_idx]
         diff_total = total - _prev_cpu_total[_prev_cpu_idx]
@@ -1536,14 +1247,14 @@ def draw_system_stats(screen, small_font, temp_c, gpu_usage: float | None, memor
     screen.blit(gpu_text, gpu_rect)
 
 def draw_wave_screen(
-    screen,
-    font,
-    small_font,
-    state: VisualState,
-    phase: float,
-    temp_c: float | None,
-    gpu_usage: float | None,
-    memory_percent: float | None,
+        screen,
+        font,
+        small_font,
+        state: VisualState,
+        phase: float,
+        temp_c: float | None,
+        gpu_usage: float | None,
+        memory_percent: float | None,
 ):
     width, height = screen.get_size()
     screen.fill((10, 14, 24))
@@ -1581,6 +1292,7 @@ def draw_wave_screen(
 
 
 def create_energy_renderer(ctx):
+    import array
     vertices = array.array(
         "f",
         [
@@ -1608,6 +1320,7 @@ def create_rect_program(ctx):
 
 def render_rect(ctx, rect_program, x: int, y: int, w: int, h: int, r: float, g: float, b: float, a: float, screen_w: int, screen_h: int):
     """Teken een effen gekleurde rechthoek als twee driehoeken (OpenGL quad)."""
+    import array
     left = (x / screen_w) * 2.0 - 1.0
     right = ((x + w) / screen_w) * 2.0 - 1.0
     top = 1.0 - (y / screen_h) * 2.0
@@ -1632,6 +1345,7 @@ def render_rect(ctx, rect_program, x: int, y: int, w: int, h: int, r: float, g: 
 
 
 def render_text(ctx, text_program, font, text: str, color, x: int, y: int, screen_w: int, screen_h: int, anchor: str = "topleft"):
+    import array
     surface = font.render(text, True, color)
     text_w, text_h = surface.get_size()
     if anchor == "topright":
@@ -1690,9 +1404,18 @@ def render_overlay(ctx, text_program, rect_program, font, small_font, state: Vis
     quit_x = quit_pad
     quit_y = quit_pad
     render_rect(ctx, rect_program, quit_x, quit_y, quit_size, quit_size, 0.80, 0.18, 0.18, 0.90, width, height)
-    # Twee lijnen vormen een "X": \ en /
     render_text(ctx, text_program, small_font, "\u00d7", (255, 255, 255), quit_x + quit_size // 2, quit_y + quit_size // 2, width, height, "center")
     buttons.append(ButtonRect(quit_x, quit_y, quit_size, quit_size, "quit"))
+
+    # --- Actief Model (onder de X-knop) ---
+    if state.active_model:
+        model_text = f"Model: {state.active_model}"
+        model_color = (255, 210, 80) # Goud-geel voor actief werkend model
+    else:
+        model_text = "Model Is Idle"
+        model_color = (150, 160, 180) # Grijs voor idle status
+
+    render_text(ctx, text_program, small_font, model_text, model_color, quit_x, quit_y + quit_size + 12, width, height, "topleft")
 
     # --- Systeem-info rechtsboven ---
     temp_label = "-- C" if temp_c is None else f"{temp_c:.1f} C"
@@ -1744,10 +1467,6 @@ def run_wave_ui(shared_state: SharedState, host: str, port: int, model: str):
     screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.FULLSCREEN | pygame.OPENGL | pygame.DOUBLEBUF)
     pygame.display.set_caption("Pi Energy Core Visual")
     width, height = screen.get_size()
-    # Hergebruik de OpenGL-context van het pygame-venster (werkt op Pi 4/5 met de
-    # Mesa V3D-driver, die maximaal OpenGL 2.1 levert). Een standalone context faalt
-    # op de Pi ("cannot create context") en zou bovendien niet naar het venster renderen.
-    # require=210 past bij de #version 120 shaders.
     ctx = moderngl.create_context(require=210)
     energy_program, energy_vbo, energy_vao = create_energy_renderer(ctx)
     text_program = create_text_program(ctx)
@@ -1769,12 +1488,11 @@ def run_wave_ui(shared_state: SharedState, host: str, port: int, model: str):
     temp_c = read_cpu_temperature()
     gpu_usage = read_gpu_usage()
     memory_percent = read_memory_usage()
-    cpu_usage = read_cpu_usage()  # eerste meting (returnt None want geen vorige sample)
+    cpu_usage = read_cpu_usage()
     next_temp_read = 0.0
     previous_ticks = pygame.time.get_ticks() / 1000.0
-    running = [True]  # list zodat geneste functies kunnen muteren
+    running = [True]
 
-    # Houd de knoppen bij van de laatste frame voor hit-testing
     current_buttons: list[ButtonRect] = []
 
     def hit_test_button(px: int, py: int) -> str | None:
@@ -1806,20 +1524,15 @@ def run_wave_ui(shared_state: SharedState, host: str, port: int, model: str):
                 shared_state.approve_top_connection(accept=True)
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_n:
                 shared_state.approve_top_connection(accept=False)
-            # Touchscreen: FINGERDOWN (pygame 2.x SDL_FINGER* events)
-            # event.x en event.y zijn genormaliseerd 0.0-1.0
             elif event.type == pygame.FINGERDOWN:
                 px = int(event.x * width)
                 py = int(event.y * height)
                 action = hit_test_button(px, py)
-                if action:
-                    handle_button_action(action)
-            # Mouse: MOUSEBUTTONDOWN (voor debuggen op laptop, of USB-muis op Pi)
+                if action: handle_button_action(action)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 px, py = event.pos
                 action = hit_test_button(px, py)
-                if action:
-                    handle_button_action(action)
+                if action: handle_button_action(action)
 
         state = shared_state.get()
         shared_state.step_transition(0.06)
@@ -1863,11 +1576,44 @@ def run_wave_ui(shared_state: SharedState, host: str, port: int, model: str):
     pygame.quit()
 
 
+def preload_models():
+    """Laadt de belangrijkste modellen alvast in het geheugen voor directe respons."""
+    def _worker():
+        print("🚀 Modellen voorladen in GPU/RAM (idle stand)...")
+        available = get_available_models()
+        if not available:
+            print("⚠️ Geen modellen gevonden in Ollama om voor te laden.")
+            return
+
+        for model in IDLE_MODELS:
+            if model not in available:
+                print(f"⏩ Overslaan: Model '{model}' niet gevonden op dit systeem.")
+                continue
+                
+            try:
+                # Gebruik de chat endpoint met een kort bericht om het model in het geheugen te trekken
+                resp = requests.post("http://127.0.0.1:11434/api/chat", json={
+                    "model": model, 
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "keep_alive": "24h",
+                    "stream": False
+                }, timeout=60) # Verhoogd naar 60s voor trage Pi 5 laden
+                
+                if resp.status_code == 200:
+                    print(f"✅ Model '{model}' staat nu in idle stand (GPU/RAM).")
+                else:
+                    print(f"⚠️ Kon model '{model}' niet voorladen (status {resp.status_code}).")
+            except Exception as e:
+                print(f"❌ Fout bij voorladen van '{model}': {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Raspberry Pi bot server + wave visual")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--model", default="phi3:mini")
+    parser.add_argument("--model", default=DEFAULT_GENERAL_MODEL)
     args = parser.parse_args()
 
     shared_state = SharedState()
@@ -1883,10 +1629,13 @@ def main():
     thread = threading.Thread(target=server_thread, daemon=True)
     thread.start()
 
-    run_wave_ui(shared_state, args.host, args.port, args.model)
+    try:
+        preload_models()
+        run_wave_ui(shared_state, args.host, args.port, args.model)
+    finally:
+        print("Sluit af...")
+        unload_models()
 
 
 if __name__ == "__main__":
     main()
-
-

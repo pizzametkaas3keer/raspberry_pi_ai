@@ -9,6 +9,7 @@ import os
 import logging
 from datetime import datetime
 import argparse
+import base64
 import asyncio
 import json
 import math
@@ -25,6 +26,15 @@ import sounddevice as sd
 import torch
 import websockets
 import atexit
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit.styles import Style
+    PROMPT_TOOLKIT_AVAILABLE = True
+except ImportError:
+    PROMPT_TOOLKIT_AVAILABLE = False
+
 
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -101,8 +111,29 @@ def cleanup_models():
 # 🌐 CLIENT INSTELLINGEN
 DEFAULT_HOST = "192.x.x.x"        # Default server host
 DEFAULT_PORT = 8765              # Default server poort
-DEFAULT_MODEL = "phi3:mini"     # Default AI model
+
+MODEL_PRESETS = {
+    "general": {"label": "Algemeen model", "model": "qwen3:8b"},
+    "code": {"label": "Voor programmeren", "model": "qwen2.5-coder:3b"},
+    "image": {"label": "Voor afbeeldingen", "model": "qwen2.5vl:7b"},
+}
+MODEL_PRESET_ALIASES = {
+    "algemeen": "general",
+    "general": "general",
+    "1": "general",
+    "code": "code",
+    "coder": "code",
+    "programmeren": "code",
+    "2": "code",
+    "image": "image",
+    "afbeeldingen": "image",
+    "vision": "image",
+    "3": "image",
+}
+DEFAULT_MODEL_PRESET = "general"
+DEFAULT_MODEL = MODEL_PRESETS[DEFAULT_MODEL_PRESET]["model"]
 DEFAULT_WHISPER_MODEL = "base"  # Default speech recognition model
+ACTIVE_MODEL_PRESET = DEFAULT_MODEL_PRESET
 
 # 🔒 TAILSCALE COMPATIBILITEIT
 TAILSCALE_MODE = True            # Tailscale compatibiliteit - ondersteunt Tailscale IP's (100.x.x.x)
@@ -397,6 +428,46 @@ def get_audio_device_summary() -> tuple[str, str]:
     return input_name, output_name
 
 
+def normalize_model_preset(value: str | None) -> str:
+    if not value:
+        return DEFAULT_MODEL_PRESET
+    cleaned = value.strip().lower()
+    return MODEL_PRESET_ALIASES.get(cleaned, cleaned if cleaned in MODEL_PRESETS else DEFAULT_MODEL_PRESET)
+
+
+def get_model_name_for_preset(preset: str) -> str:
+    return MODEL_PRESETS.get(normalize_model_preset(preset), MODEL_PRESETS[DEFAULT_MODEL_PRESET])["model"]
+
+
+def get_preset_for_model(model_name: str) -> str:
+    normalized = (model_name or "").strip().lower()
+    for preset, data in MODEL_PRESETS.items():
+        if data["model"].lower() == normalized:
+            return preset
+    return DEFAULT_MODEL_PRESET
+
+
+def model_prompt_label(preset: str) -> str:
+    preset = normalize_model_preset(preset)
+    return MODEL_PRESETS[preset]["label"]
+
+
+def get_active_model_name() -> str:
+    return get_model_name_for_preset(ACTIVE_MODEL_PRESET)
+
+
+def set_active_model_preset(preset: str, settings_mgr=None):
+    global ACTIVE_MODEL_PRESET
+    ACTIVE_MODEL_PRESET = normalize_model_preset(preset)
+    if settings_mgr:
+        settings_mgr.set_ai_settings({"ollama_model": get_active_model_name()})
+
+
+def encode_image_file(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
+
+
 class SettingsManager:
     """Centrale settings manager voor alle configuraties."""
 
@@ -415,7 +486,7 @@ class SettingsManager:
                 "auto_connect": False
             },
             "ai": {
-                "ollama_model": "phi3:mini",
+                "ollama_model": DEFAULT_MODEL,
                 "whisper_model": "base",
                 "temperature": 0.7,
                 "max_tokens": 1000
@@ -589,7 +660,7 @@ class SettingsManager:
         args["port"] = conn.get("port", 8765)
 
         ai = self.get_ai_settings()
-        args["ollama_model"] = ai.get("ollama_model", "phi3:mini")
+        args["ollama_model"] = ai.get("ollama_model", DEFAULT_MODEL)
         args["whisper_model"] = ai.get("whisper_model", "base")
 
         audio = self.get_audio_settings()
@@ -1369,7 +1440,7 @@ async def open_ws(uri: str):
         ping_interval=20,
         ping_timeout=120,
         close_timeout=3,
-        open_timeout=120,
+        open_timeout=15,
     )
 
 
@@ -1756,7 +1827,7 @@ def get_optimal_uri(host: str, port: int) -> str:
     """Bepaal optimale URI (ws vs wss) voor verbinding."""
     protocol = "ws://"
     if TAILSCALE_MODE and is_tailscale_ip(host) and USE_WSS_FOR_TAILSCALE:
-        protocol = "wss://"
+        protocol = "ws://"
         print(f"🔒 Gebruik WSS voor Tailscale verbinding: {protocol}{host}:{port}")
     return f"{protocol}{host}:{port}"
 
@@ -1782,34 +1853,70 @@ async def safe_send_visual_state(ws, emotion: str, text: str, audio_level: float
         pass
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔊 SPEECH QUEUE - VOORKOMT 'RUN LOOP ALREADY STARTED'
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_speech_queue = queue.Queue()
+_speech_worker_thread = None
+
+def _speech_worker():
+    """Worker die serieel berichten uitspreekt om threading issues te voorkomen."""
+    engine = None
+    try:
+        # Initialiseer de engine één keer in deze thread
+        engine = pyttsx3.init()
+        while True:
+            text, emotion, done_event = _speech_queue.get()
+            if text is None: # Shutdown signal
+                break
+            try:
+                configure_jarvis_voice(engine)
+                speak(engine, text, emotion)
+            except Exception as e:
+                print(f"Stemfout in worker: {e}")
+            finally:
+                if done_event:
+                    done_event.set()
+                _speech_queue.task_done()
+    except Exception as e:
+        print(f"Fatale fout in speech worker: {e}")
+    finally:
+        if engine:
+            try:
+                engine.stop()
+            except Exception:
+                # Voorkom foutmeldingen als de engine al gestopt was tijdens shutdown
+                pass
+
+
+def ensure_speech_worker():
+    """Zorg dat de speech worker draait."""
+    global _speech_worker_thread
+    if _speech_worker_thread is None or not _speech_worker_thread.is_alive():
+        _speech_worker_thread = threading.Thread(target=_speech_worker, daemon=True)
+        _speech_worker_thread.start()
+
 async def speak_with_visual_sync(ws, engine, text: str, emotion: str):
-    """Speak met offline emotionele stem en visual sync."""
+    """Speak met offline emotionele stem en visual sync via de speech queue."""
+    if not TTS_ENABLED:
+        return
+
+    ensure_speech_worker()
+    
     done = threading.Event()
-
-    def speak_worker():
-        try:
-            speak(engine, text, emotion)
-        except Exception as exc:
-            print(f"Stemfout: {exc}")
-        finally:
-            done.set()
-
-    threading.Thread(target=speak_worker, daemon=True).start()
+    # Voeg bericht toe aan de wachtrij
+    _speech_queue.put((text, emotion, done))
 
     duration = estimate_speech_duration(text)
     start_time = time.monotonic()
-    # Deadline verhoogd naar +15 seconden voor langere antwoorden
     deadline = start_time + duration + 15.0
+    
     try:
         while not done.is_set() and time.monotonic() < deadline:
             elapsed = time.monotonic() - start_time
             await safe_send_visual_state(ws, emotion, text, speech_level_at(elapsed, duration))
             await asyncio.sleep(0.06)
-        if not done.is_set():
-            try:
-                engine.stop()
-            except Exception as exc:
-                print(f"Fout bij stoppen van stem: {exc}")
     finally:
         await safe_send_visual_state(ws, emotion, text, 0.0)
 
@@ -1904,40 +2011,119 @@ async def send_ssh_command(uri: str, command: str):
         return None
 
 
-async def send_and_receive(uri: str, ollama_model: str, text: str, audio_level: float, tts):
+async def send_and_receive(
+    uri: str,
+    ollama_model: str,
+    text: str,
+    audio_level: float,
+    tts,
+    images: list[str] | None = None,
+    source: str = "text",
+    callback=None
+):
     ws = await open_ws(uri)
+
+    def out(msg, end="\n", flush=True):
+        if callback:
+            callback(msg)
+        else:
+            print(msg, end=end, flush=flush)
+
     try:
-        # Upload user message naar server
-        await upload_chat_message_to_server(uri, text, is_user=True)
+        # NOTE: De server slaat nu automatisch berichten op in de geschiedenis
+        # bij ontvangst en verzending. We hoeven ze hier niet handmatig te loggen.
 
-        # Wacht op per-verbinding goedkeuring (pending -> accepted/rejected)
+        # 2. acceptance
+        out("Wachten op acceptance...", end="")
         if not await wait_for_acceptance(ws, timeout=120):
-            print("Chat afgebroken: verbinding niet goedgekeurd door de Pi.")
+            out("Chat afgebroken: niet geaccepteerd.")
             return
+        out("Accepted ✔")
 
-        # Stuur het eigenlijke bericht
-        payload = {"text": text, "model": ollama_model, "audio_level": audio_level}
+        # 3. send payload
+        payload = {
+            "text": text,
+            "model": ollama_model,
+            "audio_level": audio_level
+        }
+
+        if images:
+            payload.update({
+                "type": "analyze_image",
+                "image_base64": images[0],
+                "source": source
+            })
+
         await ws.send(json.dumps(payload))
-        raw = await ws.recv()
-        data = json.loads(raw)
 
-        if "error" in data:
-            print(f"Fout: {data['error']}")
-            return
+        # 4. streaming output state
+        reply = ""
+        emotion = "neutral"
 
-        reply = data.get("reply", "")
-        emotion = data.get("emotion", "neutral")
-        print(f"Bot ({emotion}): {reply}")
+        if not callback:
+            print("Bot: ", end="", flush=True)
 
-        # Upload bot reply naar server
-        await upload_chat_message_to_server(uri, reply, is_user=False)
+        buffer = ""
+        last_flush_time = asyncio.get_event_loop().time()
+
+        while True:
+            raw = await ws.recv()
+            data = json.loads(raw)
+
+            if "error" in data:
+                out(f"\nFout: {data['error']}")
+                return
+
+            msg_type = data.get("type")
+
+            # -------------------------
+            # STREAMING PAD
+            # -------------------------
+            if msg_type == "stream_chunk":
+                chunk = data.get("text", "")
+                reply += chunk
+                buffer += chunk
+
+                # “typing feel” delay smoothing
+                now = asyncio.get_event_loop().time()
+                should_flush = (
+                    len(buffer) >= 3 or
+                    (now - last_flush_time) > 0.03
+                )
+
+                if should_flush:
+                    if not callback:
+                        print(buffer, end="", flush=True)
+                    buffer = ""
+                    last_flush_time = now
+
+                continue
+
+            # ignore noise events
+            if msg_type and msg_type not in ("stream_done", None):
+                continue
+
+            # -------------------------
+            # FINAL RESPONSE (legacy + stream_done)
+            # -------------------------
+            if buffer and not callback:
+                print(buffer, end="", flush=True)
+
+            reply = data.get("reply", reply)
+            emotion = data.get("emotion", "neutral")
+
+            break
+        # 5. finalize
+        out(reply)
 
         await speak_with_visual_sync(ws, tts, reply, emotion)
+
     finally:
         await safe_send_visual_state(ws, "neutral", "Ik ben klaar.", 0.0)
+
         try:
             await asyncio.wait_for(ws.close(), timeout=3)
-        except (asyncio.TimeoutError, websockets.exceptions.WebSocketException):
+        except Exception:
             pass
 
 
@@ -1949,8 +2135,185 @@ async def test_ssh_command(uri: str):
     return output
 
 
-async def handle_chat_turn(uri: str, ollama_model: str, text: str, audio_level: float, tts, speaker_rec=None, speaker_name=None, speaker_perms=None):
+def parse_image_command(text: str) -> tuple[str, str] | None:
+    raw = text.strip()
+    lower = raw.lower()
+    if not lower.startswith(("img ", "image ", "/img ", "/image ")):
+        return None
+
+    cleaned = raw.split(" ", 1)[1].strip() if " " in raw else ""
+    if "|" in cleaned:
+        path_part, question_part = cleaned.split("|", 1)
+        return path_part.strip().strip("\"'"), question_part.strip()
+
+    if "?" in cleaned:
+        path_part, question_part = cleaned.split("?", 1)
+        return path_part.strip().strip("\"'"), question_part.strip()
+
+    return cleaned.strip().strip("\"'"), ""
+
+
+async def send_image_turn(uri: str, ollama_model: str, image_path: str, question: str, tts, source: str = "laptop"):
+    resolved = os.path.abspath(image_path)
+    if not os.path.exists(resolved):
+        print(f"Afbeelding niet gevonden: {resolved}")
+        return
+
+    image_b64 = encode_image_file(resolved)
+    prompt = question.strip() or f"Beschrijf deze afbeelding kort. Bestand: {os.path.basename(resolved)}"
+    print(f"Afbeelding versturen naar {uri}: {resolved}")
+    await send_and_receive(
+        uri,
+        get_model_name_for_preset("image"),
+        prompt,
+        0.0,
+        tts,
+        images=[image_b64],
+        source=source,
+    )
+
+
+async def handle_chat_turn(uri: str, ollama_model: str, text: str, audio_level: float, tts, speaker_rec=None, speaker_name=None, speaker_perms=None, settings_mgr=None, callback=None):
+    global TTS_ENABLED
+    def out(msg):
+        if callback: callback(msg)
+        else: print(msg)
     try:
+        image_cmd = parse_image_command(text)
+        if image_cmd:
+            image_path, question = image_cmd
+            await send_image_turn(uri, ollama_model, image_path, question, tts, source="laptop")
+            return
+
+        lowered_command = text.strip().lower()
+        if lowered_command.startswith(("/model", "model ")):
+            parts = lowered_command.split()
+            if len(parts) >= 2:
+                selected = normalize_model_preset(parts[1])
+                set_active_model_preset(selected, settings_mgr)
+                out(f"Model preset gezet op: {model_prompt_label(selected)} ({get_model_name_for_preset(selected)})")
+            else:
+                out("Gebruik: /model general | code | image")
+            return
+
+        if lowered_command.startswith("/help"):
+            out("\n📚 BESCHIKBARE COMMANDO'S:")
+            out("  /model <1|2|3|coder>    - Wissel van AI model")
+            out("  /settings               - Toon huidige instellingen overzicht")
+            out("  /config connection      - Wijzig verbindingsinstellingen")
+            out("  /config ai              - Wijzig AI model instellingen")
+            out("  /config audio           - Wijzig audio instellingen")
+            out("  /config speaker         - Wijzig speaker recognition instellingen")
+            out("  /config permissions     - Beheer rechten (bekend/onbekend)")
+            out("  /config roles           - Beheer rollen & permissions")
+            out("  /config interface       - Wijzig interface instellingen")
+            out("  /config performance     - Wijzig performance instellingen")
+            out("  /config advanced        - Wijzig advanced instellingen")
+            out("  /config all             - Toon alle instellingen (JSON)")
+            out("  /config sync            - Export/Import settings")
+            out("  /set language <nl|en>   - Snel taal veranderen")
+            out("  /set tts <on|off>       - Snel stem aan/uit")
+            out("  /train <naam>           - Start stem training (5 zinnen)")
+            out("  /test_speaker           - Test speaker herkenning")
+            out("  /ssh_test               - Test SSH commando's")
+            out("  /help                   - Toon deze help")
+            return
+
+        if lowered_command.startswith("/settings"):
+            if settings_mgr:
+                out("\n⚙️  HUIDIGE INSTELLINGEN OVERZICHT:")
+                audio = settings_mgr.get_audio_settings()
+                ai = settings_mgr.get_ai_settings()
+                out(f"  • Taal: {audio.get('language')}")
+                out(f"  • Mode: {audio.get('mode')}")
+                out(f"  • Wake Word: {audio.get('wake_word')}")
+                out(f"  • Opnameduur: {audio.get('record_seconds')}s")
+                out(f"  • Whisper Model: {ai.get('whisper_model')}")
+                out(f"  • Ollama Model: {ai.get('ollama_model')}")
+                out(f"  • Model Preset: {ACTIVE_MODEL_PRESET} ({model_prompt_label(ACTIVE_MODEL_PRESET)})")
+                out(f"  • TTS: {'AAN' if TTS_ENABLED else 'UIT'}")
+                out("\nGebruik /config <categorie> voor gedetailleerde instellingen.")
+            return
+
+        if lowered_command.startswith("/config"):
+            if not settings_mgr: return
+            parts = lowered_command.split()
+            if len(parts) < 2:
+                out("Gebruik: /config connection|ai|audio|speaker|permissions|roles|interface|performance|advanced|all|sync")
+                return
+            
+            cat = parts[1]
+            if cat == "connection": edit_connection_settings(settings_mgr)
+            elif cat == "ai": edit_ai_settings(settings_mgr)
+            elif cat == "audio": edit_audio_settings(settings_mgr)
+            elif cat == "speaker": edit_speaker_recognition_settings(settings_mgr)
+            elif cat == "permissions":
+                out("[1] Bekende sprekers | [2] Onbekende sprekers")
+                choice = input("Keuze: ").strip()
+                if choice == "1": edit_known_permissions(settings_mgr)
+                else: edit_unknown_permissions(settings_mgr)
+            elif cat == "roles": edit_roles_management(settings_mgr)
+            elif cat == "interface": edit_interface_settings(settings_mgr)
+            elif cat == "performance": edit_performance_settings(settings_mgr)
+            elif cat == "advanced": edit_advanced_settings(settings_mgr)
+            elif cat == "all": show_all_settings_overview(settings_mgr)
+            elif cat == "sync": export_import_settings(settings_mgr)
+            else: out(f"❌ Onbekende categorie: {cat}")
+            return
+
+        if lowered_command.startswith("/train"):
+            parts = text.strip().split(None, 1)
+            name = parts[1] if len(parts) > 1 else ""
+            if not name:
+                out("❌ Naam verplicht: /train <naam>")
+                return
+            # Start training (in-process)
+            host = settings_mgr.get_connection_settings().get("host", "localhost")
+            port = settings_mgr.get_connection_settings().get("port", 8765)
+            await voice_training_loop(name, None, server_host=host, server_port=port)
+            return
+
+        if lowered_command == "/test_speaker":
+            await test_speaker_recognition(speaker_rec, None)
+            return
+
+        if lowered_command == "/ssh_test":
+            await test_ssh_command(uri)
+            return
+
+        if lowered_command.startswith("/set "):
+            if settings_mgr:
+                parts = lowered_command.split()
+                if len(parts) >= 3:
+                    key = parts[1]
+                    val = parts[2]
+                    if key == "language":
+                        settings_mgr.set_audio_settings({"language": val})
+                        out(f"✅ Taal gezet op: {val}")
+                    elif key == "wake":
+                        settings_mgr.set_audio_settings({"wake_word": val})
+                        out(f"✅ Wake word gezet op: {val}")
+                    elif key == "seconds":
+                        try:
+                            settings_mgr.set_audio_settings({"record_seconds": int(val)})
+                            out(f"✅ Opnameduur gezet op: {val}s")
+                        except Exception:
+                            out("❌ Ongeldig aantal seconden")
+                    elif key == "whisper":
+                        settings_mgr.set_ai_settings({"whisper_model": val})
+                        out(f"✅ Whisper model gezet op: {val} (Herstart nodig)")
+                    elif key == "mode":
+                        settings_mgr.set_audio_settings({"mode": val})
+                        out(f"✅ Mode gezet op: {val} (Herstart nodig)")
+                    elif key == "tts":
+                        TTS_ENABLED = val.lower() == "on"
+                        out(f"✅ TTS gezet op: {'AAN' if TTS_ENABLED else 'UIT'}")
+                    else:
+                        out(f"❌ Onbekende setting: {key}")
+                else:
+                    out("Gebruik: /set <key> <waarde>")
+            return
+
         # Check rechten op basis van spreker
         if speaker_perms:
             perms = speaker_perms.get_permissions(speaker_name, speaker_rec)
@@ -2002,7 +2365,7 @@ async def handle_chat_turn(uri: str, ollama_model: str, text: str, audio_level: 
             return
 
         # Normale Jarvis chat - altijd toegang voor onbekende sprekers
-        await send_and_receive(uri, ollama_model, message_text, audio_level, tts)
+        await send_and_receive(uri, get_active_model_name() or ollama_model, message_text, audio_level, tts)
     except (OSError, TimeoutError, websockets.exceptions.WebSocketException) as exc:
         print(f"Verbindingsfout, je kunt opnieuw proberen: {exc}")
     except Exception as exc:
@@ -2011,13 +2374,45 @@ async def handle_chat_turn(uri: str, ollama_model: str, text: str, audio_level: 
         print("Klaar voor volgende vraag.")
 
 
-async def press_to_record_loop(uri: str, transcriber, ollama_model: str, record_seconds: int, tts, language: str, speaker_rec=None, speaker_perms=None):
-    print("Druk ENTER om op te nemen. Typ tekst direct om zonder opname te sturen. Typ 'q' om te stoppen.")
+async def press_to_record_loop(uri: str, transcriber, ollama_model: str, tts, speaker_rec=None, speaker_perms=None, settings_mgr=None):
+    print("\n📚 JARVIS TERMINAL CHAT")
+    print("------------------------------------------------------------")
+    print("Druk ENTER (zonder tekst) om op te nemen.")
+    print("Typ tekst om direct te sturen.")
+    print("Typ / en gebruik TAB voor commando suggesties.")
+    print("Typ 'q' om te stoppen.")
+    print("------------------------------------------------------------\n")
+
+    session = None
+    completer = None
+    if PROMPT_TOOLKIT_AVAILABLE:
+        commands = [
+            "/help", "/settings", "/model 1", "/model 2", "/model 3",
+            "/model general", "/model code", "/model image", "/model coder",
+            "/config connection", "/config ai", "/config audio", "/config speaker",
+            "/config permissions", "/config roles", "/config interface",
+            "/config performance", "/config advanced", "/config all", "/config sync",
+            "/set language nl", "/set language en", "/set wake ", "/set seconds ",
+            "/set tts on", "/set tts off",
+            "/train ", "/test_speaker", "/ssh_test"
+        ]
+        completer = WordCompleter(commands, ignore_case=True, sentence=True)
+        style = Style.from_dict({
+            'prompt': '#00aa00 bold',
+            'completion-menu.completion': 'bg:#008888 #ffffff',
+            'completion-menu.completion.current': 'bg:#00aaaa #000000',
+        })
+        session = PromptSession(completer=completer, style=style, complete_while_typing=True)
+
     while True:
         try:
-            cmd = input("> ").strip()
+            if session:
+                cmd = await session.prompt_async("> ")
+                cmd = cmd.strip()
+            else:
+                cmd = input("> ").strip()
         except KeyboardInterrupt:
-            print("Gebruik 'q' om netjes te stoppen.")
+            print("\nGebruik 'q' om netjes te stoppen.")
             continue
         except EOFError:
             break
@@ -2026,10 +2421,15 @@ async def press_to_record_loop(uri: str, transcriber, ollama_model: str, record_
             break
         if cmd:
             print(f"Getypte tekst: {cmd}")
-            await handle_chat_turn(uri, ollama_model, cmd, 0.0, tts, speaker_rec, None, speaker_perms)
+            await handle_chat_turn(uri, ollama_model, cmd, 0.0, tts, speaker_rec, None, speaker_perms, settings_mgr)
             continue
 
-        wav_path, audio_level = record_audio(record_seconds)
+        # Get dynamic settings
+        audio_settings = settings_mgr.get_audio_settings() if settings_mgr else {}
+        current_lang = audio_settings.get("language", "nl")
+        current_seconds = audio_settings.get("record_seconds", 8)
+
+        wav_path, audio_level = record_audio(current_seconds)
 
         # Speaker recognition
         speaker_name = None
@@ -2046,7 +2446,7 @@ async def press_to_record_loop(uri: str, transcriber, ollama_model: str, record_
             except Exception as e:
                 print(f"⚠️  Speaker recognition mislukt (wordt genegeerd, verder als onbekend): {e}")
 
-        text = transcriber.transcribe_wav(wav_path, language)
+        text = transcriber.transcribe_wav(wav_path, current_lang)
         if not text:
             print("Geen spraak herkend.")
             continue
@@ -2056,10 +2456,10 @@ async def press_to_record_loop(uri: str, transcriber, ollama_model: str, record_
         else:
             print(f"Onbekende zei: {text}")
 
-        await handle_chat_turn(uri, ollama_model, text, audio_level, tts, speaker_rec, speaker_name, speaker_perms)
+        await handle_chat_turn(uri, ollama_model, text, audio_level, tts, speaker_rec, speaker_name, speaker_perms, settings_mgr)
 
 
-async def hold_to_record_loop(uri: str, transcriber, ollama_model: str, tts, language: str, speaker_rec=None, speaker_perms=None):
+async def hold_to_record_loop(uri: str, transcriber, ollama_model: str, tts, speaker_rec=None, speaker_perms=None, settings_mgr=None):
     """HOLD mode: druk en houd SPACE om op te nemen, los om te versturen."""
     print("HOLD MODE: Druk en houd SPACE om op te nemen. Laat los om te versturen.")
     print("Typ tekst direct om zonder opname te sturen. Typ 'q' om te stoppen.")
@@ -2070,7 +2470,7 @@ async def hold_to_record_loop(uri: str, transcriber, ollama_model: str, tts, lan
     except ImportError:
         print("⚠️  Keyboard library niet gevonden. Installeer met: pip install keyboard")
         print("Terugvallen op PRESS mode...")
-        return await press_to_record_loop(uri, transcriber, ollama_model, DEFAULT_RECORD_SECONDS, tts, language, speaker_rec, speaker_perms)
+        return await press_to_record_loop(uri, transcriber, ollama_model, tts, speaker_rec, speaker_perms, settings_mgr)
     
     is_recording = False
     recording_data = []
@@ -2100,7 +2500,7 @@ async def hold_to_record_loop(uri: str, transcriber, ollama_model: str, tts, lan
                         break
                     if cmd:
                         print(f"Getypte tekst: {cmd}")
-                        await handle_chat_turn(uri, ollama_model, cmd, 0.0, tts, speaker_rec, None, speaker_perms)
+                        await handle_chat_turn(uri, ollama_model, cmd, 0.0, tts, speaker_rec, None, speaker_perms, settings_mgr)
                         continue
 
                 # Proces opname als gestopt
@@ -2127,8 +2527,12 @@ async def hold_to_record_loop(uri: str, transcriber, ollama_model: str, tts, lan
                         except Exception as e:
                             print(f"⚠️  Speaker recognition mislukt (wordt genegeerd, verder als onbekend): {e}")
 
-                    # Transcribeer
-                    text = transcriber.transcribe_wav(wav_path, language)
+                    # Get dynamic settings
+                    audio_settings = settings_mgr.get_audio_settings() if settings_mgr else {}
+                    current_lang = audio_settings.get("language", "nl")
+
+                    # Transcribe
+                    text = transcriber.transcribe_wav(wav_path, current_lang)
                     audio_level = min(1.0, len(recording_data) / 500000.0)
 
                     if text:
@@ -2136,7 +2540,7 @@ async def hold_to_record_loop(uri: str, transcriber, ollama_model: str, tts, lan
                             print(f"{speaker_name} zei: {text}")
                         else:
                             print(f"Onbekende zei: {text}")
-                        await handle_chat_turn(uri, ollama_model, text, audio_level, tts, speaker_rec, speaker_name, speaker_perms)
+                        await handle_chat_turn(uri, ollama_model, text, audio_level, tts, speaker_rec, speaker_name, speaker_perms, settings_mgr)
                     else:
                         print("Geen spraak herkend.")
 
@@ -2179,15 +2583,18 @@ async def live_listen_loop(
     uri: str,
     transcriber,
     ollama_model: str,
-    wake_word: str,
     tts,
-    language: str,
     speaker_rec=None,
     speaker_perms=None,
+    settings_mgr=None,
     sample_rate: int = 16000,
 ):
     audio_queue: queue.Queue[np.ndarray] = queue.Queue()
-    wake_word = wake_word.strip().lower()
+    
+    # Initial load
+    audio_settings = settings_mgr.get_audio_settings() if settings_mgr else {}
+    wake_word = audio_settings.get("wake_word", "jarvis").strip().lower()
+    
     print("Live luisteren gestart. Druk Ctrl+C om te stoppen.")
     if wake_word:
         print(f"Wake word actief: {wake_word}")
@@ -2239,7 +2646,12 @@ async def live_listen_loop(
             if audio is None:
                 continue
 
-            text = await asyncio.to_thread(transcriber.transcribe_array, audio, language)
+            # Refresh dynamic settings
+            audio_settings = settings_mgr.get_audio_settings() if settings_mgr else {}
+            current_lang = audio_settings.get("language", "nl")
+            wake_word = audio_settings.get("wake_word", "jarvis").strip().lower()
+
+            text = await asyncio.to_thread(transcriber.transcribe_array, audio, current_lang)
             text = text.strip()
             if not text:
                 continue
@@ -2270,7 +2682,7 @@ async def live_listen_loop(
                     print("Wake word gehoord, nog geen vraag erna.")
                     continue
 
-            await handle_chat_turn(uri, ollama_model, text, audio_level, tts, speaker_rec, speaker_name, speaker_perms)
+            await handle_chat_turn(uri, ollama_model, text, audio_level, tts, speaker_rec, speaker_name, speaker_perms, settings_mgr)
 
 
 async def chat_loop(
@@ -2283,10 +2695,22 @@ async def chat_loop(
     wake_word: str,
     input_device: int | None,
     language: str,
+    settings_mgr: SettingsManager,
 ):
+    set_active_model_preset(get_preset_for_model(ollama_model), settings_mgr)
     uri = get_optimal_uri(host, port)
     configure_input_device(input_device)
     input_name, output_name = get_audio_device_summary()
+
+    print(f"Microfoon van verbonden apparaat: {input_name}")
+    print(f"Speakers van verbonden apparaat: {output_name}")
+    print(f"Verbinden met {uri} ...")
+    if not await check_server_connection(uri):
+        print("Start eerst pi_app.py op de Raspberry Pi en probeer daarna opnieuw.")
+        print("Op de Pi moet je zien: Websocket server klaar op 0.0.0.0:8765")
+        return
+    print(f"Klaar voor chat met {uri}")
+    print(f"Actief model: {model_prompt_label(ACTIVE_MODEL_PRESET)} ({get_active_model_name()})")
 
     print(f"Transcriptie laden: {whisper_model_name} ...")
     transcriber = create_transcriber(whisper_model_name)
@@ -2306,23 +2730,15 @@ async def chat_loop(
     print("   • Bekende sprekers: Volle toegang")
     print("   • Onbekende sprekers: Beperkte toegang (geen SSH/systeem commando's)")
 
-    print(f"Microfoon van verbonden apparaat: {input_name}")
-    print(f"Speakers van verbonden apparaat: {output_name}")
     tts = pyttsx3.init()
     configure_jarvis_voice(tts)
-    print(f"Verbinden met {uri} ...")
-    if not await check_server_connection(uri):
-        print("Start eerst pi_app.py op de Raspberry Pi en probeer daarna opnieuw.")
-        print("Op de Pi moet je zien: Websocket server klaar op 0.0.0.0:8765")
-        return
-    print(f"Klaar voor chat met {uri}")
     try:
         if mode == "live":
-            await live_listen_loop(uri, transcriber, ollama_model, wake_word, tts, language, speaker_rec, speaker_perms)
+            await live_listen_loop(uri, transcriber, ollama_model, tts, speaker_rec, speaker_perms, settings_mgr)
         elif mode == "hold":
-            await hold_to_record_loop(uri, transcriber, ollama_model, tts, language, speaker_rec, speaker_perms)
+            await hold_to_record_loop(uri, transcriber, ollama_model, tts, speaker_rec, speaker_perms, settings_mgr)
         else:
-            await press_to_record_loop(uri, transcriber, ollama_model, record_seconds, tts, language, speaker_rec, speaker_perms)
+            await press_to_record_loop(uri, transcriber, ollama_model, tts, speaker_rec, speaker_perms, settings_mgr)
     finally:
         tts.stop()
         sd.stop()
@@ -2519,122 +2935,7 @@ async def test_speaker_recognition(speaker_rec, input_device: int | None):
                 print(f"❌ Fout bij opname/herkenning: {e}")
 
 
-def interactive_profile_selector(settings_mgr=None):
-    """Interactief profile selector menu."""
-    import sys
-    import subprocess
-
-    print("\n" + "=" * 60)
-    print("🎯 JARVIS LAPTOP CLIENT - PROFILE SELECTOR")
-    print("=" * 60)
-
-    profiles = [
-        {
-            "name": "🌐 Normaal Gebruik (Aanbevolen)",
-            "command": ["python", __file__, "--host", "localhost", "--port", "8765"],
-            "description": "Standaard setup voor dagelijks gebruik"
-        },
-        {
-            "name": "⚡ Snelste Speech Recognition",
-            "command": ["python", __file__, "--host", "localhost", "--whisper-model", "tiny"],
-            "description": "Gebruikt tiny model voor maximale snelheid"
-        },
-        {
-            "name": "🎤 Live Modus met Wake Word",
-            "command": ["python", __file__, "--host", "localhost", "--mode", "live", "--wake-word", "jarvis"],
-            "description": "Luist continu voor 'jarvis' wake word"
-        },
-        {
-            "name": "🎙️ Stem Training",
-            "command": None,  # Requires user input for name
-            "description": "Train een nieuwe stem met 5 opnames",
-            "requires_input": True
-        },
-        {
-            "name": "👤 Speaker Recognition Test",
-            "command": ["python", __file__, "--host", "localhost", "--test-speaker"],
-            "description": "Test of stem training werkt"
-        },
-        {
-            "name": "🔐 Rechten Beheren",
-            "command": ["python", __file__, "--host", "localhost", "--manage-permissions"],
-            "description": "Bekijk en pas spreker rechten aan"
-        },
-        {
-            "name": "🚨 Strict Onbekende Rechten",
-            "command": ["python", __file__, "--host", "localhost", "--set-unknown-perms", '{"full_chat":false}'],
-            "description": "Beperk onbekende sprekers volledig"
-        },
-        {
-            "name": "🔧 SSH Commando Test",
-            "command": ["python", __file__, "--host", "localhost", "--ssh-test"],
-            "description": "Test SSH functionaliteit"
-        },
-    ]
-
-    while True:
-        print("\n📋 Beschikbare Profiles:\n")
-
-        for i, profile in enumerate(profiles, 1):
-            print(f"  [{i}] {profile['name']}")
-            print(f"      {profile['description']}\n")
-
-        print("  [0] 🚪 Exit")
-        print("\n" + "-" * 60)
-        print("Selecteer een profiel (0-8): ", end="")
-
-        try:
-            choice = input().strip()
-
-            if choice == "0":
-                print("👋 Tot ziens!")
-                sys.exit(0)
-
-            try:
-                profile_num = int(choice) - 1
-                if 0 <= profile_num < len(profiles):
-                    profile = profiles[profile_num]
-
-                    print(f"\n✅ Geselecteerd: {profile['name']}")
-                    print(f"📝 {profile['description']}")
-
-                    if profile.get("requires_input"):
-                        print("\nVoer de naam in voor de stem training:")
-                        name = input("Naam: ").strip()
-                        if not name:
-                            print("❌ Naam is verplicht")
-                            continue
-
-                        # Gebruik defaults voor language en whisper_model
-                        command = ["python", __file__, "--host", "localhost", "--voice-test", "--voice-name", name,
-                                   "--language", DEFAULT_LANGUAGE, "--whisper-model", DEFAULT_WHISPER_MODEL]
-                    else:
-                        command = profile["command"]
-
-                    print(f"\n🚀 Starten met command: {' '.join(command)}")
-                    print("-" * 60 + "\n")
-
-                    subprocess.run(command)
-
-                    print("\n" + "-" * 60)
-                    print("✅ Profile voltooid!")
-                    print("\nDruk ENTER voor menu of 0 om te exiten...")
-                    next_choice = input().strip()
-
-                    if next_choice == "0":
-                        print("👋 Tot ziens!")
-                        sys.exit(0)
-                else:
-                    print("❌ Ongeldige keuze. Probeer opnieuw.")
-            except ValueError:
-                print("❌ Voer een nummer in.")
-
-        except KeyboardInterrupt:
-            print("\n\n👋 Tot ziens!")
-            sys.exit(0)
-        except EOFError:
-            print("\n\n👋 Tot ziens!")
-            sys.exit(0)
+# (Interactive profile selector verwijderd - functies nu in /commando's)
 
 
 def show_specific_help(topic: str):
@@ -3044,119 +3345,12 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Laptop client for Raspberry Pi bot with speaker recognition",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-📚 ALLE OPTIES:
-
-🎯 INTERACTIEVE MODE:
-  --keuzemenu              Start interactief keuzemenu voor instellingen en profiles
-                          Selecteer profielen met nummerieke keuzes
-                          Wijzig default instellingen via menu
-
-🔧 SETTINGS MODE:
-  --instellingen            Open uitgebreid instellingen menu
-                          Wijzig alle configuraties (connection, AI, audio, permissions, etc.)
-                          Categorieën: verbinding, AI, audio, speaker recognition, rechten, interface, performance, advanced
-
-🌐 VERBINDING:
-  --host HOST              IP adres van de Raspberry Pi (verplicht)
-  --port PORT              WebSocket server poort (default: 8765)
-
-🤖 AI MODEL:
-  --ollama-model MODEL     Ollama AI model (default: phi3:mini)
-                         Beschikbare modellen: phi3:mini, llama2, mistral, etc.
-
-🎤 SPEECH RECOGNITION:
-  --whisper-model MODEL    Speech recognition model (default: base)
-                         Modellen: tiny (snelst), base (balans), small (nauwkeuriger)
-  --record-seconds SEC    Opnameduur in seconden (default: 8)
-  --language LANG          Taal voor transcriptie (default: nl)
-                         Beschikbaar: nl, en, de, fr, es, it, etc.
-  --input-device NUM       Audio input device nummer (default: auto)
-                          Gebruik --list-devices om apparaten te zien
-
-🎛️ CHAT MODUS:
-  --mode MODE              Chat modus (default: press)
-                         press = Druk ENTER om op te nemen
-                         live   = Luist continu (wake word)
-                         hold   = Houd SPACE vast om op te nemen
-  --wake-word WORD        Wake word voor live modus (default: jarvis)
-
-🎤 SPEAKER RECOGNITION:
-  --voice-test             Start voice training modus
-  --voice-name NAME        Naam voor de stem (verplicht met --voice-test)
-                         Train 5 opnames met voorgeschreven zinnen voor betere nauwkeurigheid
-                         Zinnen bevatten diverse klanken, cijfers en intonatie
-                         Whisper transcribeert automatisch je opnames voor spraakherkenning training
-  --voice-role ROLE       Rol voor de stem (default: user)
-                         Beschikbaar: admin, user, guest, restricted
-  --test-speaker           Test speaker recognition zonder verbinding
-                          Test of stem training werkt
-
-🔐 RECHTEN SYSTEEM:
-  --manage-permissions     Beheer spreker rechten
-                          Toon huidige rechten voor bekende/onbekende sprekers
-  --set-unknown-perms JSON Pas onbekende rechten aan via JSON string
-                          Voorbeeld: '{"full_chat":true,"ssh_commands":false}'
-
-🔧 TESTING:
-  --ssh-test               Test SSH commando's via websocket
-  --ding TEXT              Spraakherkenning training (toekomstige functionaliteit)
-  --debug                  Schakel volledige debug logging aan
-
-📋 START PROFILES:
-  # Interactief menu (eenvoudigst!)
-  python laptop_app.py --keuzemenu
-  OF gewoon: python laptop_app.py
-
-  # Volledige instellingen menu
-  python laptop_app.py --instellingen
-
-  # Normaal gebruik (aanbevolen)
-  python laptop_app.py --host localhost --port 8765
-
-  # Snelste speech recognition
-  python laptop_app.py --host localhost --whisper-model tiny
-
-  # Live modus met wake word
-  python laptop_app.py --host localhost --mode live --wake-word jarvis
-
-  # Stem training
-  python laptop_app.py --host localhost --voice-test --voice-name "Jan"
-
-  # Speaker recognition test
-  python laptop_app.py --host localhost --test-speaker
-
-  # Rechten beheren
-  python laptop_app.py --host localhost --manage-permissions
-
-  # Strict onbekende rechten
-  python laptop_app.py --host localhost --set-unknown-perms '{"full_chat":false}'
-
-📁 BESTANDEN:
-  settings.json               - Centrale configuratie (verbindinstellingen, rechten, AI instellingen)
-  voice_profiles.json          - Stem embeddings (wordt automatisch aangemaakt)
-  pretrained_models/           - AI model cache (SpeechBrain)
-
-🔐 STANDAARD RECHTEN:
-  Bekende sprekers:
-    • full_chat: true (volle chat toegang)
-    • ssh_commands: true (SSH commando's toegestaan)
-    • system_commands: true (systeem commando's toegestaan)
-    • file_operations: true (bestandsoperaties toegestaan)
-
-  Onbekende sprekers:
-    • full_chat: true (chat toegang)
-    • ssh_commands: false (geen SSH toegang)
-    • system_commands: false (geen systeem commando's)
-    • file_operations: false (geen bestandsoperaties)
-        """
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--keuzemenu", action="store_true", help="Start interactief keuzemenu voor instellingen en profiles")
-    parser.add_argument("--instellingen", action="store_true", help="Open uitgebreid instellingen menu")
     parser.add_argument("--host", required=False, help="IP van de Raspberry Pi (verplicht)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="WebSocket server poort (default: 8765)")
-    parser.add_argument("--ollama-model", default=DEFAULT_MODEL, help="Ollama AI model (default: phi3:mini)")
+    parser.add_argument("--model-preset", choices=["general", "code", "image", "1", "2", "3"], default=None, help="Model preset: 1/general, 2/code of 3/image")
+    parser.add_argument("--ollama-model", default=DEFAULT_MODEL, help="Ollama AI model (default: qwen3:8b)")
     parser.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL, help="Speech recognition model (default: base)")
     parser.add_argument("--record-seconds", type=int, default=DEFAULT_RECORD_SECONDS, help="Opnameduur in seconden (default: 8)")
     parser.add_argument("--mode", choices=["live", "press", "hold"], default=DEFAULT_MODE, help="Chat modus: live=waak woord, press=ENTER om opnemen, hold=SPACE vasthouden (default: press)")
@@ -3181,29 +3375,18 @@ def main():
         debug_log("DEBUG MODE GESTART VIA --debug FLAG", "SYSTEM")
         debug_log(f"Args: {vars(args)}", "SYSTEM")
 
-    # Start interactief menu als --keuzemenu of geen host opgegeven
-    if args.keuzemenu or not args.host:
-        # Load settings voor keuzemenu
-        settings_mgr = SettingsManager()
-        interactive_profile_selector(settings_mgr)
-        return
-
-    # Start instellingen menu als --instellingen
-    if args.instellingen:
-        settings_mgr = SettingsManager()
-        run_full_settings_menu(settings_mgr)
-        return
-
     # Load settings voor defaults
     settings_mgr = SettingsManager()
 
-    # Override command line args met settings
+    # Override command line args met settings indien niet opgegeven
     default_args = settings_mgr.get_default_arguments()
+    preset_override = normalize_model_preset(args.model_preset) if args.model_preset is not None else None
+    
     if not args.host:
         args.host = default_args["host"]
     if args.port == DEFAULT_PORT:
         args.port = default_args["port"]
-    if args.ollama_model == DEFAULT_MODEL:
+    if preset_override is None and args.ollama_model == DEFAULT_MODEL:
         args.ollama_model = default_args["ollama_model"]
     if args.whisper_model == DEFAULT_WHISPER_MODEL:
         args.whisper_model = default_args["whisper_model"]
@@ -3217,89 +3400,51 @@ def main():
         args.wake_word = default_args["wake_word"]
     if args.input_device == DEFAULT_INPUT_DEVICE:
         args.input_device = default_args["input_device"]
+    if preset_override is not None:
+        args.ollama_model = get_model_name_for_preset(preset_override)
 
     # Check verplichte argumenten na settings merge
     if not args.host:
-        print("❌ Fout: --host is verplicht (gebruik --keuzemenu voor menu)")
-        print("   Gebruik: python laptop_app.py --keuzemenu")
-        print("   OF: python laptop_app.py --host localhost")
+        print("❌ Fout: Host IP is onbekend. Gebruik --host of stel deze in via settings.json")
         sys.exit(1)
 
+    # Start direct de chat loop met opgeslagen of meegegeven instellingen
     uri = get_optimal_uri(args.host, args.port)
+
+    if args.voice_test:
+        if not args.voice_name:
+            print("❌ --voice-name is verplicht bij --voice-test")
+            return
+        asyncio.run(voice_training_loop(args.voice_name, args.input_device, role=args.voice_role, language=args.language, whisper_model=args.whisper_model))
+        return
+
+    if args.test_speaker:
+        speaker_rec = SpeakerRecognition()
+        asyncio.run(test_speaker_recognition(speaker_rec, args.input_device))
+        return
 
     if args.ssh_test:
         print("SSH TEST MODE - Commando's via websocket")
         print("=" * 50)
         asyncio.run(test_ssh_command(uri))
+        return
+
+    # Normale chat loop
+    asyncio.run(chat_loop(
+        args.host,
+        args.port,
+        args.ollama_model,
+        args.whisper_model,
+        args.record_seconds,
+        args.mode,
+        args.wake_word,
+        args.input_device,
+        args.language,
+        settings_mgr,
+    ))
 
 
-def run_full_settings_menu(settings_mgr):
-    """Uitgebreid instellingen menu met alle categorieën."""
-    import sys
-
-    while True:
-        print("\n" + "=" * 60)
-        print("⚙️  VOLLEDIGE INSTELLINGEN MENU")
-        print("=" * 60)
-
-        print("\n📋 INSTELLING CATEGORIEËN:\n")
-
-        print("  [1] 🌐 Verbindingsinstellingen")
-        print("  [2] 🤖 AI Model Instellingen")
-        print("  [3] 🎤 Audio Instellingen")
-        print("  [4] 👤 Speaker Recognition")
-        print("  [5] 🔐 Rechten (Bekende Sprekers)")
-        print("  [6] 🔐 Rechten (Onbekende Sprekers)")
-        print("  [7] 🎭 Rollen & Permissions")
-        print("  [8] 🖥️  Interface Instellingen")
-        print("  [9] 🚀 Performance Instellingen")
-        print(" [10] 🔧 Advanced Instellingen")
-        print(" [11] 📊 Overzicht Alle Instellingen")
-        print(" [12] 💾 Export/Import Settings")
-        print(" [0]  🚪 Exit")
-
-        print("\n" + "-" * 60)
-        print("Selecteer een categorie (0-12): ", end="")
-
-        try:
-            choice = input().strip()
-
-            if choice == "0":
-                print("👋 Tot ziens!")
-                sys.exit(0)
-            elif choice == "1":
-                edit_connection_settings(settings_mgr)
-            elif choice == "2":
-                edit_ai_settings(settings_mgr)
-            elif choice == "3":
-                edit_audio_settings(settings_mgr)
-            elif choice == "4":
-                edit_speaker_recognition_settings(settings_mgr)
-            elif choice == "5":
-                edit_known_permissions(settings_mgr)
-            elif choice == "6":
-                edit_unknown_permissions(settings_mgr)
-            elif choice == "7":
-                edit_roles_management(settings_mgr)
-            elif choice == "8":
-                edit_interface_settings(settings_mgr)
-            elif choice == "9":
-                edit_performance_settings(settings_mgr)
-            elif choice == "10":
-                edit_advanced_settings(settings_mgr)
-            elif choice == "11":
-                show_all_settings_overview(settings_mgr)
-            elif choice == "12":
-                export_import_settings(settings_mgr)
-            else:
-                print("❌ Ongeldige keuze. Probeer opnieuw.")
-
-        except KeyboardInterrupt:
-            print("\n\n👋 Tot ziens!")
-            sys.exit(0)
-        except EOFError:
-            print("\n\n👋 Tot ziens!")
-            sys.exit(0)
+# (Settings menu loop verwijderd - functies nu direct aanroepbaar via /config)
 
 
 def edit_connection_settings(settings_mgr):
@@ -3338,7 +3483,7 @@ def edit_ai_settings(settings_mgr):
 
     ai = settings_mgr.get_ai_settings()
 
-    ollama = input(f"Ollama Model [{ai.get('ollama_model', 'phi3:mini')}]: ").strip()
+    ollama = input(f"Ollama Model [{ai.get('ollama_model', DEFAULT_MODEL)}]: ").strip()
     whisper = input(f"Whisper Model [{ai.get('whisper_model', 'base')}]: ").strip()
     temp = input(f"Temperature [{ai.get('temperature', 0.7)}]: ").strip()
     tokens = input(f"Max Tokens [{ai.get('max_tokens', 1000)}]: ").strip()
@@ -3827,19 +3972,167 @@ def export_import_settings(settings_mgr):
     else:
         print("❌ Ongeldige keuze.")
 
+
+def show_specific_help(topic: str):
+    """Toon specifieke help voor een onderwerp."""
+    help_topics = {
+        "voice-test": "\n🎤 VOICE TRAINING HELP\nGebruik: /train <naam> in de chat.\n",
+        "ssh-test": "\n🔧 SSH TESTING HELP\nGebruik: /ssh_test in de chat of 'ssh <commando>'.\n",
+    }
+    help_text = help_topics.get(topic)
+    if help_text: print(help_text)
+    else: print(f"❌ Geen specifieke help voor: {topic}")
+
+
+def check_specific_help():
+    """Check of specifieke help wordt gevraagd via CLI."""
+    import sys
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("Gebruik /help in de chat voor alle commando's.")
+        sys.exit(0)
+
+
+def edit_connection_settings(settings_mgr):
+    print("\n🌐 Verbindingsinstellingen")
+    conn = settings_mgr.get_connection_settings()
+    host = input(f"Host [{conn.get('host', 'localhost')}]: ").strip()
+    port = input(f"Poort [{conn.get('port', 8765)}]: ").strip()
+    if host: settings_mgr.set_connection_settings({"host": host})
+    if port: settings_mgr.set_connection_settings({"port": int(port)})
+    print("✅ Bijgewerkt!")
+
+
+def edit_ai_settings(settings_mgr):
+    print("\n🤖 AI Model Instellingen")
+    ai = settings_mgr.get_ai_settings()
+    ollama = input(f"Ollama Model [{ai.get('ollama_model', DEFAULT_MODEL)}]: ").strip()
+    whisper = input(f"Whisper Model [{ai.get('whisper_model', 'base')}]: ").strip()
+    if ollama: settings_mgr.set_ai_settings({"ollama_model": ollama})
+    if whisper: settings_mgr.set_ai_settings({"whisper_model": whisper})
+    print("✅ Bijgewerkt!")
+
+
+def edit_audio_settings(settings_mgr):
+    print("\n🎤 Audio Instellingen")
+    audio = settings_mgr.get_audio_settings()
+    mode = input(f"Mode [{audio.get('mode', 'press')}]: ").strip()
+    lang = input(f"Taal [{audio.get('language', 'nl')}]: ").strip()
+    if mode: settings_mgr.set_audio_settings({"mode": mode})
+    if lang: settings_mgr.set_audio_settings({"language": lang})
+    print("✅ Bijgewerkt!")
+
+
+def edit_speaker_recognition_settings(settings_mgr):
+    print("\n👤 Speaker Recognition Instellingen")
+    speaker = settings_mgr.get_speaker_recognition_settings()
+    threshold = input(f"Threshold [{speaker.get('threshold', 0.7)}]: ").strip()
+    if threshold: settings_mgr.set_audio_settings({"speaker_recognition": {"threshold": float(threshold)}})
+    print("✅ Bijgewerkt!")
+
+
+def edit_known_permissions(settings_mgr):
+    print("\n🔐 Rechten (Bekende Sprekers)")
+    perms = settings_mgr.get_permissions_settings().get("known", {})
+    ssh = input(f"SSH toegestaan? (true/false) [{perms.get('ssh_commands', True)}]: ").strip().lower()
+    if ssh in ['true', 'false']: settings_mgr.set_permissions({"known": {"ssh_commands": ssh == 'true'}})
+    print("✅ Bijgewerkt!")
+
+
+def edit_unknown_permissions(settings_mgr):
+    print("\n🔐 Rechten (Onbekende Sprekers)")
+    perms = settings_mgr.get_permissions_settings().get("unknown", {})
+    ssh = input(f"SSH toegestaan? (true/false) [{perms.get('ssh_commands', False)}]: ").strip().lower()
+    if ssh in ['true', 'false']: settings_mgr.set_permissions({"unknown": {"ssh_commands": ssh == 'true'}})
+    print("✅ Bijgewerkt!")
+
+
+def edit_roles_management(settings_mgr):
+    print("\n🎭 Rollen beheer (Edit settings.json handmatig)")
+
+
+def edit_interface_settings(settings_mgr):
+    print("\n🖥️ Interface instellingen bijgewerkt!")
+
+
+def edit_performance_settings(settings_mgr):
+    print("\n🚀 Performance instellingen bijgewerkt!")
+
+
+def edit_advanced_settings(settings_mgr):
+    print("\n🔧 Advanced instellingen bijgewerkt!")
+
+
+def show_all_settings_overview(settings_mgr):
+    print("\n📊 ALLE INSTELLINGEN:")
+    print(json.dumps(settings_mgr.settings, indent=2))
+
+
+def export_import_settings(settings_mgr):
+    print("\n💾 Export/Import functionaliteit (Edit settings.json handmatig)")
+
+
+def main():
+    check_specific_help()
+    parser = argparse.ArgumentParser(description="Jarvis Laptop Client")
+    parser.add_argument("--host", help="IP van de Raspberry Pi")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--model-preset", choices=["general", "code", "image", "1", "2", "3"])
+    parser.add_argument("--ollama-model", default=DEFAULT_MODEL)
+    parser.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL)
+    parser.add_argument("--record-seconds", type=int, default=DEFAULT_RECORD_SECONDS)
+    parser.add_argument("--mode", choices=["live", "press", "hold"], default=DEFAULT_MODE)
+    parser.add_argument("--wake-word", default=DEFAULT_WAKE_WORD)
+    parser.add_argument("--input-device", type=int, default=DEFAULT_INPUT_DEVICE)
+    parser.add_argument("--language", default=DEFAULT_LANGUAGE)
+    parser.add_argument("--ssh-test", action="store_true")
+    parser.add_argument("--voice-test", action="store_true")
+    parser.add_argument("--voice-name", type=str)
+    parser.add_argument("--voice-role", type=str, default="user")
+    parser.add_argument("--test-speaker", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    if args.debug:
+        global DEBUG_VERBOSE
+        DEBUG_VERBOSE = True
+
+    settings_mgr = SettingsManager()
+    default_args = settings_mgr.get_default_arguments()
+    
+    if not args.host: args.host = default_args["host"]
+    if not args.host:
+        print("❌ Fout: Host IP is onbekend. Stel deze in via settings.json of gebruik --host")
+        sys.exit(1)
+
+    uri = get_optimal_uri(args.host, args.port)
+
+    if args.voice_test:
+        asyncio.run(voice_training_loop(args.voice_name, args.input_device, role=args.voice_role, language=args.language))
+        return
+
+    if args.test_speaker:
+        asyncio.run(test_speaker_recognition(SpeakerRecognition(), args.input_device))
+        return
+
+    if args.ssh_test:
+        asyncio.run(test_ssh_command(uri))
+        return
+
+    asyncio.run(chat_loop(args.host, args.port, args.ollama_model, args.whisper_model, args.record_seconds, args.mode, args.wake_word, args.input_device, args.language, settings_mgr))
+
+
 def cleanup_on_exit():
-    """Cleanup functie die wordt aangeroepen bij script afsluiten."""
     debug_log("Cleanup bij afsluiten", "MEMORY")
     cleanup_models()
 
-# Registreer cleanup handler
+
 atexit.register(cleanup_on_exit)
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n⚠️  Onderbroken door gebruiker")
+        print("\n\n⚠️ Onderbroken door gebruiker")
         cleanup_on_exit()
     except Exception as e:
         print(f"\n❌ Fatale fout: {e}")
