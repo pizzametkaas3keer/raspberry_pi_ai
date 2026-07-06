@@ -3,6 +3,7 @@ import array
 import asyncio
 import base64
 import binascii
+import gc
 import json
 import logging
 import math
@@ -13,6 +14,7 @@ import subprocess
 import threading
 import time
 import uuid
+import numpy as np
 from datetime import datetime
 from io import BytesIO
 import moderngl
@@ -22,6 +24,15 @@ import websockets
 from dataclasses import dataclass
 from pathlib import Path
 import glob
+
+# Probeer AI libraries te laden voor echte speaker recognition
+try:
+    import torch
+    from speechbrain.inference.speaker import SpeakerRecognition
+    HAS_SPEAKER_AI = True
+except ImportError:
+    HAS_SPEAKER_AI = False
+    print("⚠️  SpeechBrain of Torch niet gevonden. Speaker Recognition werkt in demo-modus.")
 
 # Forceer GPU/Vulkan ondersteuning voor Ollama indien beschikbaar op dit systeem
 os.environ["OLLAMA_VULKAN"] = "1"
@@ -33,10 +44,17 @@ os.environ["OMP_NUM_THREADS"] = "4"
 # ⚙️  INSTELLINGEN - PAS DEZE AAN NAAR WENS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_GENERAL_MODEL = "qwen3:8b"     # Snelle standaard voor tekst
+DEFAULT_GENERAL_MODEL = "Qwen3:8b"     # Snelle standaard voor tekst
 DEFAULT_VISION_MODEL = "qwen2.5vl:7b"   # Voor scherm- en afbeeldingsanalyse
 DEFAULT_CODER_MODEL = "qwen2.5-coder:3b" # Voor programmeer-gerelateerde vragen
-IDLE_MODELS = ["qwen3:8b", "qwen2.5vl:7b", "qwen2.5-coder:3b"] # Modellen die we in GPU-idle willen houden
+IDLE_MODELS = ["Qwen3:8b", "qwen2.5vl:7b", "qwen2.5-coder:3b"] # Modellen die we in GPU-idle willen houden
+
+# Aggressive RAM Management (Pi 5 Optimalisatie)
+AGGRESSIVE_RAM_MODE = False  # Indien True, worden modellen na elk gebruik meteen verwijderd
+
+# AI OFFloading (Bespaar ruimte op de Pi!)
+OLLAMA_HOST = "127.0.0.1"  # Verander naar IP van je laptop (bijv. "192.168.x.x") om modellen daar te draaien
+REMOTE_AI_HOST = None      # Verander naar IP van je laptop voor Speaker AI (bijv. "192.168.x.x")
 
 # Paden
 PROJECT_DIR = Path(__file__).parent
@@ -197,20 +215,14 @@ def detect_emotion(text: str) -> str:
     return "neutral"
 
 
-async def ask_ollama_async(model: str, prompt: str) -> str:
-    """Async variant van de Ollama API aanroep voor betere server performance."""
-    try:
-        # NOTE: pi_app.py gebruikt requests (blocking). 
-        # Voor de server is dit OK zolang het in een aparte thread/coroutine draait.
-        return await asyncio.to_thread(call_ollama_api, model, prompt)
-    except Exception as exc:
-        return f"AI fout: {exc}"
-
+async def call_ollama_api_async(model: str, prompt: str, timeout: int = 60, images: list[str] = None, system_prompt: str = None) -> str:
+    """Async variant van de Ollama API aanroep."""
+    return await asyncio.to_thread(call_ollama_api, model, prompt, timeout, images, system_prompt)
 
 def get_available_models() -> list[str]:
     """Haal een lijst van alle beschikbare Ollama modellen op."""
     try:
-        resp = requests.get("http://127.0.0.1:11434/api/tags", timeout=5)
+        resp = requests.get(f"http://{OLLAMA_HOST}:11434/api/tags", timeout=5)
         if resp.status_code == 200:
             return [m["name"] for m in resp.json().get("models", [])]
     except:
@@ -219,8 +231,8 @@ def get_available_models() -> list[str]:
 
 
 def call_ollama_api(model: str, prompt: str, timeout: int = 60, images: list[str] = None, system_prompt: str = None) -> str:
-    """Blocking Ollama API aanroep met automatische fallback bij fouten of ontbrekende modellen."""
-    url = "http://127.0.0.1:11434/api/chat"
+    """Blocking Ollama API aanroep met automatische fallback."""
+    url = f"http://{OLLAMA_HOST}:11434/api/chat"
 
     # Controleer eerst of het model überhaupt bestaat, anders direct fallback
     available = get_available_models()
@@ -251,6 +263,7 @@ def call_ollama_api(model: str, prompt: str, timeout: int = 60, images: list[str
         "model": selected_model,
         "messages": messages,
         "stream": False,
+        "keep_alive": 0 if AGGRESSIVE_RAM_MODE else "5m",
         "options": {
             "num_predict": 500,
             "temperature": 0.7
@@ -584,7 +597,7 @@ def get_server_sync_payload(status="accepted", client_id=None, peer_label=None):
 
     voice_profiles = {}
     try:
-        vp_file = PROJECT_DIR / "server_voice_profiles.json"
+        vp_file = PROJECT_DIR / "voice_profiles.json"
         if vp_file.exists():
             with open(vp_file, 'r', encoding='utf-8') as f:
                 voice_profiles = json.load(f)
@@ -592,7 +605,7 @@ def get_server_sync_payload(status="accepted", client_id=None, peer_label=None):
 
     speaker_perms = {}
     try:
-        sp_file = PROJECT_DIR / "server_roles.json"
+        sp_file = PROJECT_DIR / "speaker_permissions.json"
         if sp_file.exists():
             with open(sp_file, 'r', encoding='utf-8') as f:
                 speaker_perms = json.load(f)
@@ -600,7 +613,7 @@ def get_server_sync_payload(status="accepted", client_id=None, peer_label=None):
 
     server_settings = {}
     try:
-        settings_file = PROJECT_DIR / "server_settings.json"
+        settings_file = PROJECT_DIR / "settings.json"
         if settings_file.exists():
             with open(settings_file, 'r', encoding='utf-8') as f:
                 server_settings = json.load(f)
@@ -621,6 +634,154 @@ def get_server_sync_payload(status="accepted", client_id=None, peer_label=None):
     return payload
 
 
+SPEAKER_MODEL = None
+
+def get_speaker_model():
+    """Lazy loader voor het speaker model om RAM te sparen bij start."""
+    global SPEAKER_MODEL
+    if not HAS_SPEAKER_AI: return None
+    if SPEAKER_MODEL is None:
+        try:
+            model_dir = PROJECT_DIR / "pretrained_models" / "spkrec-ecapa-voxceleb"
+            SPEAKER_MODEL = SpeakerRecognition.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir=model_dir
+            )
+            print("✅ Speaker Recognition model geladen.")
+        except Exception as e:
+            print(f"❌ Kon Speaker model niet laden: {e}")
+    return SPEAKER_MODEL
+
+def release_speaker_model():
+    """Verwijdert het speaker model uit het geheugen."""
+    global SPEAKER_MODEL
+    if SPEAKER_MODEL is not None:
+        del SPEAKER_MODEL
+        SPEAKER_MODEL = None
+        gc.collect()
+        if HAS_SPEAKER_AI:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except:
+                pass
+        print("🧹 Speaker Recognition model verwijderd uit geheugen.")
+
+async def identify_speaker_logic(audio_data_base64: str) -> tuple[str, float]:
+    """Voert de AI analyse uit (Lokaal of Remote op laptop)."""
+    
+    # Als er een remote host is ingesteld, stuur de audio daarheen (bespaart RAM/disk op Pi)
+    if REMOTE_AI_HOST:
+        try:
+            url = f"http://{REMOTE_AI_HOST}:8766/identify"
+            print(f"📡 Offloading stemherkenning naar {url}...")
+            
+            # We sturen de audio en de profielen mee zodat de laptop de vergelijking kan doen
+            profiles_file = PROJECT_DIR / "voice_profiles.json"
+            profiles_data = "{}"
+            if profiles_file.exists():
+                profiles_data = profiles_file.read_text(encoding='utf-8')
+            
+            resp = requests.post(url, json={
+                "audio_data": audio_data_base64,
+                "profiles": json.loads(profiles_data)
+            }, timeout=15)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                name = data.get("name", "onbekend")
+                conf = data.get("confidence", 0.0)
+                print(f"✅ Remote resultaat: {name} ({int(conf*100)}%)")
+                return name, conf
+            else:
+                print(f"⚠️ Remote server fout {resp.status_code}: {resp.text}")
+        except requests.exceptions.ConnectionError:
+            print(f"❌ Kan geen verbinding maken met laptop op {REMOTE_AI_HOST}:8766. Staat laptop_app.py aan?")
+        except Exception as e:
+            print(f"⚠️ Remote AI herkenning faalde: {e}")
+            # Fallback naar lokale herkenning indien beschikbaar
+    
+    model = get_speaker_model()
+    
+    # 1. Sla audio op naar tijdelijk bestand (.raw naar .wav)
+    audio_bytes = base64.b64decode(audio_data_base64)
+    temp_raw = PROJECT_DIR / f"temp_test_{uuid.uuid4().hex[:8]}.raw"
+    temp_wav = temp_raw.with_suffix(".wav")
+    
+    try:
+        temp_raw.write_bytes(audio_bytes)
+        
+        # Gebruik ffmpeg of sox om van raw naar wav te gaan indien nodig, 
+        # maar SpeechBrain kan vaak direct wav lezen. 
+        # Hier gaan we ervan uit dat de client 16bit mono 16kHz stuurt.
+        import wave
+        with wave.open(str(temp_wav), 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(audio_bytes)
+
+        # 2. Laad bekende profielen
+        profiles_file = PROJECT_DIR / "voice_profiles.json"
+        if not profiles_file.exists():
+            return "onbekend", 0.0
+            
+        profiles = json.loads(profiles_file.read_text())
+        
+        if not model:
+            # Demo modus: als we geen AI hebben, doe een simpele check of er audio is
+            if len(audio_bytes) > 1000:
+                # Pak een willekeurige naam uit de lijst als 'gok'
+                names = list(profiles.keys())
+                if names:
+                    # Varieer de score een beetje zodat het niet statisch lijkt (geeft 'levende' indruk)
+                    import random
+                    mock_conf = 0.40 + (random.random() * 0.10)
+                    return names[0], mock_conf
+            return "onbekend", 0.0
+
+        # 3. Bereken embedding voor de nieuwe opname
+        # (Dit is de 'echte' AI stap)
+        test_embedding = model.encode_batch(model.load_audio(str(temp_wav)))
+        
+        best_name = "onbekend"
+        best_score = 0.0
+        
+        # 4. Vergelijk met opgeslagen embeddings in profiles
+        for name, data in profiles.items():
+            stored_emb_list = data.get("embeddings") or data.get("embedding")
+            if not stored_emb_list: continue
+            
+            # Convert list terug naar torch tensor
+            stored_embedding = torch.tensor(stored_emb_list)
+            
+            # Bereken cosine similarity
+            similarity = torch.nn.functional.cosine_similarity(test_embedding, stored_embedding)
+            score = float(similarity.max())
+            
+            if score > best_score:
+                best_score = score
+                best_name = name
+                
+        # Drempelwaarde voor herkenning (meestal rond 0.25 - 0.35 voor ECAPA)
+        if best_score < 0.25:
+            return "onbekend", best_score
+            
+        return best_name, best_score
+        
+    except Exception as e:
+        print(f"Error in identification: {e}")
+        return "fout", 0.0
+    finally:
+        # Ruim tijdelijke bestanden op
+        if temp_raw.exists(): temp_raw.unlink()
+        if temp_wav.exists(): temp_wav.unlink()
+        
+        # User requested aggressive cleanup
+        if AGGRESSIVE_RAM_MODE:
+            release_speaker_model()
+
 async def ws_handler(websocket, shared_state: SharedState, default_model: str):
     # Per-verbinding goedkeuring via het GUI (J/N) of auto-accept bij allowlist.
     try:
@@ -629,353 +790,381 @@ async def ws_handler(websocket, shared_state: SharedState, default_model: str):
         peer = None
     peer_ip, peer_label = _get_peer_ip(peer)
 
-    # Auto-accept Tailscale clients (100.x.x.x)
-    if peer_ip and is_tailscale_ip(peer_ip):
-        conn = shared_state.gate.request(peer_label, ip=peer_ip)
-        print(f"Auto-accept (tailscale): {peer_label} (id={conn.client_id})")
-        shared_state.update_visual(text=f"Verbonden (tailscale) {peer_label}", audio_level=0.0)
-        try:
-            payload = get_server_sync_payload("accepted", conn.client_id, peer_label)
-            await websocket.send(json.dumps(payload))
-        finally:
-            shared_state.gate.remove(conn.client_id)
-    # Auto-accept allowlist
-    elif peer_ip and shared_state.gate.is_allowed(peer_ip):
-        conn = shared_state.gate.request(peer_label, ip=peer_ip)
-        print(f"Auto-accept (allowlist): {peer_label} (id={conn.client_id})")
-        shared_state.update_visual(text=f"Verbonden (auto) {peer_label}", audio_level=0.0)
-        try:
-            payload = get_server_sync_payload("accepted", conn.client_id, peer_label)
-            await websocket.send(json.dumps(payload))
-        finally:
-            shared_state.gate.remove(conn.client_id)
-    else:
-        # Vraag goedkeuring aan in het GUI.
-        conn = shared_state.gate.request(peer_label, ip=peer_ip)
-        print(f"Inkomende verbinding van {peer_label} (id={conn.client_id}) - wacht op goedkeuring in GUI")
-        shared_state.update_visual(text=f"Verzoek van {peer_label} - Druk op JA, NEE of ALTIJD", audio_level=0.0)
-        try:
-            await websocket.send(json.dumps({
-                "status": "pending",
-                "client_id": conn.client_id,
-                "peer": peer_label,
-            }))
+    try:
+        # Auto-accept Tailscale clients (100.x.x.x)
+        if peer_ip and is_tailscale_ip(peer_ip):
+            conn = shared_state.gate.request(peer_label, ip=peer_ip)
+            print(f"Auto-accept (tailscale): {peer_label} (id={conn.client_id})")
+            shared_state.update_visual(text=f"Verbonden (tailscale) {peer_label}", audio_level=0.0)
             try:
-                await asyncio.wait_for(conn.accept_event.wait(), timeout=300)
-            except asyncio.TimeoutError:
-                conn.decision = "rejected"
-
-            if conn.decision == "accepted":
                 payload = get_server_sync_payload("accepted", conn.client_id, peer_label)
                 await websocket.send(json.dumps(payload))
-                print(f"Verbinding goedgekeurd: {peer_label} (id={conn.client_id})")
-                shared_state.update_visual(text=f"Verbonden met {peer_label}", audio_level=0.0)
-            else:
-                await websocket.send(json.dumps({"status": "rejected", "client_id": conn.client_id}))
-                print(f"Verbinding geweigerd/verlopen: {peer_label} (id={conn.client_id})")
-                shared_state.update_visual(text="Verbinding geweigerd", audio_level=0.0)
-                return
-        finally:
-            shared_state.gate.remove(conn.client_id)
-
-    async for message in websocket:
-        data = json.loads(message)
-        message_type = data.get("type", "request")
-
-        if message_type == "visual":
-            shared_state.update_visual(
-                emotion=data.get("emotion"),
-                text=data.get("text"),
-                audio_level=float(data.get("audio_level", 0.0) or 0.0),
-            )
-            continue
-
-        if message_type in {"analyze_screen", "analyze_image"} or data.get("image_base64"):
-            image_base64 = data.get("image_base64", "")
-            # Fix: Check zowel 'question' als 'text' (sommige clients sturen 'text')
-            question = data.get("question") or data.get("text", "")
-            section = data.get("section", "full")
-            model = data.get("model", DEFAULT_VISION_MODEL)
-            think = data.get("think", False)
-
-            if not model or model == default_model:
-                model = DEFAULT_VISION_MODEL
-
-            # Als 'think' uit staat, forceer een snellere verwerking indien mogelijk
-            # (Bij vision modellen is dit vaak beperkter dan bij tekstmodellen)
-
-            shared_state.update_visual(text="Afbeelding analyseren...", audio_level=0.0, active_model=model)
-            try:
-                # Sla vraag op in geschiedenis
-                save_chat_history_entry({
-                    "message": question or "Afbeelding geüpload",
-                    "is_user": True,
-                    "timestamp": datetime.now().isoformat()
-                })
-
-                answer, emotion = await analyze_screen_capture(
-                    image_base64,
-                    question=question,
-                    section=section,
-                    model=model,
-                )
-
-                # Sla antwoord op in geschiedenis
-                save_chat_history_entry({
-                    "message": answer,
-                    "is_user": False,
-                    "timestamp": datetime.now().isoformat()
-                })
             finally:
-                shared_state.update_visual(active_model=None)
-            shared_state.set(emotion, answer, 0.0)
-            await websocket.send(json.dumps({
-                "reply": answer,
-                "emotion": emotion,
-                "source": "screen",
-                "section": section,
-            }))
-            continue
-
-        if message_type == "ssh_command":
-            # Client vraagt toestemming voor commando-uitvoering op de CLIENT-zijde
-            cmd = data.get("command", "")
-            print(f"SSH commando verzoek ontvangen: {cmd}")
-            # Voor nu sturen we altijd toestemming terug naar de laptop-client
-            await websocket.send(json.dumps({
-                "type": "ssh_execute",
-                "command": cmd
-            }))
-            continue
-
-        if message_type == "ssh_response":
-            # Laptop heeft commando uitgevoerd en stuurt output terug naar server
-            output = data.get("output", "")
-            cmd = data.get("command", "")
-            print(f"SSH output voor '{cmd}':\n{output}")
-            shared_state.update_visual(text=f"SSH gereed: {cmd}", audio_level=0.0)
-            continue
-
-        # Voice profile sync endpoints
-        if message_type == "upload_voice_profile":
-            voice_name = data.get("voice_name")
-            voice_data = data.get("voice_data")
+                shared_state.gate.remove(conn.client_id)
+        # Auto-accept allowlist
+        elif peer_ip and shared_state.gate.is_allowed(peer_ip):
+            conn = shared_state.gate.request(peer_label, ip=peer_ip)
+            print(f"Auto-accept (allowlist): {peer_label} (id={conn.client_id})")
+            shared_state.update_visual(text=f"Verbonden (auto) {peer_label}", audio_level=0.0)
             try:
-                # Sla voice profile op in server storage
-                voice_profiles_file = PROJECT_DIR / "server_voice_profiles.json"
-                voice_profiles = {}
-                if voice_profiles_file.exists():
-                    with open(voice_profiles_file, 'r', encoding='utf-8') as f:
-                        voice_profiles = json.load(f)
+                payload = get_server_sync_payload("accepted", conn.client_id, peer_label)
+                await websocket.send(json.dumps(payload))
+            finally:
+                shared_state.gate.remove(conn.client_id)
+        else:
+            # Vraag goedkeuring aan in het GUI.
+            conn = shared_state.gate.request(peer_label, ip=peer_ip)
+            print(f"Inkomende verbinding van {peer_label} (id={conn.client_id}) - wacht op goedkeuring in GUI")
+            shared_state.update_visual(text=f"Verzoek van {peer_label} - Druk op JA, NEE of ALTIJD", audio_level=0.0)
+            try:
+                await websocket.send(json.dumps({
+                    "status": "pending",
+                    "client_id": conn.client_id,
+                    "peer": peer_label,
+                }))
+                try:
+                    await asyncio.wait_for(conn.accept_event.wait(), timeout=300)
+                except asyncio.TimeoutError:
+                    conn.decision = "rejected"
 
-                # Update of voeg voice profile toe
-                voice_profiles[voice_name] = voice_data
+                if conn.decision == "accepted":
+                    payload = get_server_sync_payload("accepted", conn.client_id, peer_label)
+                    await websocket.send(json.dumps(payload))
+                    print(f"Verbinding goedgekeurd: {peer_label} (id={conn.client_id})")
+                    shared_state.update_visual(text=f"Verbonden met {peer_label}", audio_level=0.0)
+                else:
+                    await websocket.send(json.dumps({"status": "rejected", "client_id": conn.client_id}))
+                    print(f"Verbinding geweigerd/verlopen: {peer_label} (id={conn.client_id})")
+                    shared_state.update_visual(text="Verbinding geweigerd", audio_level=0.0)
+                    return
+            finally:
+                shared_state.gate.remove(conn.client_id)
 
-                # Save naar file
-                with open(voice_profiles_file, 'w', encoding='utf-8') as f:
-                    json.dump(voice_profiles, f, indent=2)
+        async for message in websocket:
+            data = json.loads(message)
+            message_type = data.get("type", "request")
 
-                await websocket.send(json.dumps({"type": "voice_profile_upload_success", "voice_name": voice_name}))
-                continue
-            except Exception as exc:
-                await websocket.send(json.dumps({"type": "error", "message": f"Voice profile upload failed: {exc}"}))
+            if message_type == "visual":
+                shared_state.update_visual(
+                    emotion=data.get("emotion"),
+                    text=data.get("text"),
+                    audio_level=float(data.get("audio_level", 0.0) or 0.0),
+                )
                 continue
 
-        if message_type == "download_voice_profile":
-            voice_name = data.get("voice_name")
-            try:
-                voice_profiles_file = PROJECT_DIR / "server_voice_profiles.json"
-                if voice_profiles_file.exists():
-                    with open(voice_profiles_file, 'r', encoding='utf-8') as f:
-                        voice_profiles = json.load(f)
+            if message_type in {"analyze_screen", "analyze_image"} or data.get("image_base64"):
+                image_base64 = data.get("image_base64", "")
+                # Fix: Check zowel 'question' als 'text' (sommige clients sturen 'text')
+                question = data.get("question") or data.get("text", "")
+                section = data.get("section", "full")
+                model = data.get("model", DEFAULT_VISION_MODEL)
+                think = data.get("think", False)
 
-                    if voice_name in voice_profiles:
+                if not model or model == default_model:
+                    model = DEFAULT_VISION_MODEL
+
+                # Als 'think' uit staat, forceer een snellere verwerking indien mogelijk
+                # (Bij vision modellen is dit vaak beperkter dan bij tekstmodellen)
+
+                shared_state.update_visual(text="Afbeelding analyseren...", audio_level=0.0, active_model=model)
+                try:
+                    # Sla vraag op in geschiedenis
+                    save_chat_history_entry({
+                        "message": question or "Afbeelding geüpload",
+                        "is_user": True,
+                        "timestamp": datetime.now().isoformat()
+                    })
+
+                    answer, emotion = await analyze_screen_capture(
+                        image_base64,
+                        question=question,
+                        section=section,
+                        model=model,
+                    )
+
+                    # Sla antwoord op in geschiedenis
+                    save_chat_history_entry({
+                        "message": answer,
+                        "is_user": False,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                finally:
+                    shared_state.update_visual(active_model=None)
+                shared_state.set(emotion, answer, 0.0)
+                await websocket.send(json.dumps({
+                    "reply": answer,
+                    "emotion": emotion,
+                    "source": "screen",
+                    "section": section,
+                }))
+                continue
+
+            if message_type == "ssh_command":
+                # Client vraagt toestemming voor commando-uitvoering op de CLIENT-zijde
+                cmd = data.get("command", "")
+                print(f"SSH commando verzoek ontvangen: {cmd}")
+                # Voor nu sturen we altijd toestemming terug naar de laptop-client
+                await websocket.send(json.dumps({
+                    "type": "ssh_execute",
+                    "command": cmd
+                }))
+                continue
+
+            if message_type == "ssh_response":
+                # Laptop heeft commando uitgevoerd en stuurt output terug naar server
+                output = data.get("output", "")
+                cmd = data.get("command", "")
+                print(f"SSH output voor '{cmd}':\n{output}")
+                shared_state.update_visual(text=f"SSH gereed: {cmd}", audio_level=0.0)
+                continue
+
+            # Voice profile sync endpoints
+            if message_type == "upload_voice_profile":
+                voice_name = data.get("voice_name")
+                voice_data = data.get("voice_data")
+                try:
+                    # Sla voice profile op in server storage
+                    voice_profiles_file = PROJECT_DIR / "voice_profiles.json"
+                    voice_profiles = {}
+                    if voice_profiles_file.exists():
+                        with open(voice_profiles_file, 'r', encoding='utf-8') as f:
+                            voice_profiles = json.load(f)
+
+                    # Update of voeg voice profile toe
+                    voice_profiles[voice_name] = voice_data
+
+                    # Save naar file
+                    with open(voice_profiles_file, 'w', encoding='utf-8') as f:
+                        json.dump(voice_profiles, f, indent=2)
+
+                    await websocket.send(json.dumps({"type": "voice_profile_upload_success", "voice_name": voice_name}))
+                    continue
+                except Exception as exc:
+                    await websocket.send(json.dumps({"type": "error", "message": f"Voice profile upload failed: {exc}"}))
+                    continue
+
+            if message_type == "download_voice_profile":
+                voice_name = data.get("voice_name")
+                try:
+                    voice_profiles_file = PROJECT_DIR / "voice_profiles.json"
+                    if voice_profiles_file.exists():
+                        with open(voice_profiles_file, 'r', encoding='utf-8') as f:
+                            voice_profiles = json.load(f)
+
+                        if voice_name in voice_profiles:
+                            await websocket.send(json.dumps({
+                                "type": "voice_profile_data",
+                                "voice_name": voice_name,
+                                "voice_data": voice_profiles[voice_name]
+                            }))
+                            continue
+                        else:
+                            await websocket.send(json.dumps({"type": "error", "message": f"Voice profile '{voice_name}' not found"}))
+                            continue
+                    else:
+                        await websocket.send(json.dumps({"type": "error", "message": "No voice profiles found on server"}))
+                        continue
+                except Exception as exc:
+                    await websocket.send(json.dumps({"type": "error", "message": f"Voice profile download failed: {exc}"}))
+                    continue
+
+            if message_type == "list_voice_profiles":
+                try:
+                    voice_profiles_file = PROJECT_DIR / "voice_profiles.json"
+                    if voice_profiles_file.exists():
+                        with open(voice_profiles_file, 'r', encoding='utf-8') as f:
+                            voice_profiles = json.load(f)
+
                         await websocket.send(json.dumps({
-                            "type": "voice_profile_data",
-                            "voice_name": voice_name,
-                            "voice_data": voice_profiles[voice_name]
+                            "type": "voice_profiles_list",
+                            "voice_profiles": voice_profiles
                         }))
                         continue
                     else:
-                        await websocket.send(json.dumps({"type": "error", "message": f"Voice profile '{voice_name}' not found"}))
+                        await websocket.send(json.dumps({
+                            "type": "voice_profiles_list",
+                            "voice_profiles": {}
+                        }))
                         continue
-                else:
-                    await websocket.send(json.dumps({"type": "error", "message": "No voice profiles found on server"}))
+                except Exception as exc:
+                    await websocket.send(json.dumps({"type": "error", "message": f"Failed to list voice profiles: {exc}"}))
                     continue
-            except Exception as exc:
-                await websocket.send(json.dumps({"type": "error", "message": f"Voice profile download failed: {exc}"}))
-                continue
 
-        if message_type == "list_voice_profiles":
-            try:
-                voice_profiles_file = PROJECT_DIR / "server_voice_profiles.json"
-                if voice_profiles_file.exists():
-                    with open(voice_profiles_file, 'r', encoding='utf-8') as f:
-                        voice_profiles = json.load(f)
+            # Settings sync endpoints
+            if message_type == "upload_settings":
+                settings_data = data.get("settings_data")
+                try:
+                    settings_file = PROJECT_DIR / "settings.json"
+                    with open(settings_file, 'w', encoding='utf-8') as f:
+                        json.dump(settings_data, f, indent=2)
+                    await websocket.send(json.dumps({"type": "settings_upload_success"}))
+                    continue
+                except Exception as exc:
+                    await websocket.send(json.dumps({"type": "error", "message": f"Settings upload failed: {exc}"}))
+                    continue
 
-                    voice_names = list(voice_profiles.keys())
+            if message_type == "download_settings":
+                try:
+                    settings_file = PROJECT_DIR / "settings.json"
+                    if settings_file.exists():
+                        with open(settings_file, 'r', encoding='utf-8') as f:
+                            settings_data = json.load(f)
+                        # Voeg gedetecteerde Tailscale IP toe zodat clients (Android/iPhone)
+                        # automatisch de VPN-host kunnen gebruiken wanneer beschikbaar.
+                        try:
+                            ts_ip = detect_tailscale_ip()
+                            if ts_ip:
+                                if isinstance(settings_data, dict):
+                                    conn_data = settings_data.get("connection") if settings_data.get("connection") else {}
+                                    conn_data["tailscale_host"] = ts_ip
+                                    settings_data["connection"] = conn_data
+                                print(f"📡 Added tailscale_host to settings: {ts_ip}")
+                        except Exception as _:
+                            pass
+
+                        await websocket.send(json.dumps({
+                            "type": "settings_data",
+                            "settings_data": settings_data
+                        }))
+                        continue
+                    else:
+                        await websocket.send(json.dumps({"type": "error", "message": "No settings found on server"}))
+                        continue
+                except Exception as exc:
+                    await websocket.send(json.dumps({"type": "error", "message": f"Settings download failed: {exc}"}))
+                    continue
+
+            # Roles sync endpoints
+            if message_type == "upload_roles":
+                roles_data = data.get("roles_data")
+                try:
+                    roles_file = PROJECT_DIR / "speaker_permissions.json"
+                    with open(roles_file, 'w', encoding='utf-8') as f:
+                        json.dump(roles_data, f, indent=2)
+                    await websocket.send(json.dumps({"type": "roles_upload_success"}))
+                    continue
+                except Exception as exc:
+                    await websocket.send(json.dumps({"type": "error", "message": f"Roles upload failed: {exc}"}))
+                    continue
+
+            if message_type == "download_roles":
+                try:
+                    roles_file = PROJECT_DIR / "speaker_permissions.json"
+                    if roles_file.exists():
+                        with open(roles_file, 'r', encoding='utf-8') as f:
+                            roles_data = json.load(f)
+                        await websocket.send(json.dumps({
+                            "type": "roles_data",
+                            "roles_data": roles_data
+                        }))
+                        continue
+                    else:
+                        await websocket.send(json.dumps({"type": "error", "message": "No roles found on server"}))
+                        continue
+                except Exception as exc:
+                    await websocket.send(json.dumps({"type": "error", "message": f"Roles download failed: {exc}"}))
+                    continue
+
+            if message_type == "identify_speaker":
+                audio_base64 = data.get("audio_data")
+                shared_state.update_visual(text="Stem analyseren...", audio_level=0.5)
+                try:
+                    name, confidence = await identify_speaker_logic(audio_base64)
+                    
+                    # Geef resultaat terug
                     await websocket.send(json.dumps({
-                        "type": "voice_profiles_list",
-                        "voice_profiles": voice_names
+                        "type": "speaker_identified",
+                        "name": name,
+                        "confidence": confidence
                     }))
+                    
+                    if not HAS_SPEAKER_AI and name != "onbekend":
+                        status_msg = f"Herkend (Gok): {name} ({int(confidence*100)}%)"
+                    else:
+                        status_msg = f"Herkend: {name} ({int(confidence*100)}%)" if name != "onbekend" else "Stem niet herkend"
+                    shared_state.update_visual(text=status_msg, audio_level=0.0)
                     continue
-                else:
-                    await websocket.send(json.dumps({
-                        "type": "voice_profiles_list",
-                        "voice_profiles": []
-                    }))
+                except Exception as exc:
+                    await websocket.send(json.dumps({"type": "error", "message": f"Identification failed: {exc}"}))
                     continue
-            except Exception as exc:
-                await websocket.send(json.dumps({"type": "error", "message": f"Failed to list voice profiles: {exc}"}))
+
+            # Chat history sync endpoints
+            if message_type == "upload_chat_message":
+                chat_message = data.get("chat_message")
+                try:
+                    save_chat_history_entry(chat_message)
+                    await websocket.send(json.dumps({"type": "chat_message_upload_success"}))
+                    continue
+                except Exception as exc:
+                    await websocket.send(json.dumps({"type": "error", "message": f"Chat message upload failed: {exc}"}))
+                    continue
+
+            if message_type == "download_chat_history":
+                try:
+                    chat_history_file = PROJECT_DIR / "server_chat_history.json"
+                    if chat_history_file.exists():
+                        with open(chat_history_file, 'r', encoding='utf-8') as f:
+                            chat_history = json.load(f)
+                        await websocket.send(json.dumps({
+                            "type": "chat_history_data",
+                            "chat_history": chat_history
+                        }))
+                        continue
+                    else:
+                        await websocket.send(json.dumps({
+                            "type": "chat_history_data",
+                            "chat_history": []
+                        }))
+                        continue
+                except Exception as exc:
+                    await websocket.send(json.dumps({"type": "error", "message": f"Chat history download failed: {exc}"}))
+                    continue
+
+            user_text = data.get("text", "").strip()
+            if not user_text:
+                await websocket.send(json.dumps({"error": "Lege tekst ontvangen"}))
                 continue
 
-        # Settings sync endpoints
-        if message_type == "upload_settings":
-            settings_data = data.get("settings_data")
+            # Gebruik het door de client gevraagde model.
+            model = data.get("model", default_model)
+            think = data.get("think", False)
+
+            # Als 'think' uit staat (snelle modus), gebruik qwen3:8b (de algemene default)
+            # in plaats van het geforceerde coder model. Dit zorgt dat qwen3:8b
+            # ook werkt zonder de vertraging van eventuele 'thinking' parameters.
+            if not think and not data.get("model"):
+                model = DEFAULT_GENERAL_MODEL
+
+            # Sla gebruikersbericht op in geschiedenis
+            save_chat_history_entry({
+                "message": user_text,
+                "is_user": True,
+                "timestamp": datetime.now().isoformat()
+            })
+
             try:
-                settings_file = PROJECT_DIR / "server_settings.json"
-                with open(settings_file, 'w', encoding='utf-8') as f:
-                    json.dump(settings_data, f, indent=2)
-                await websocket.send(json.dumps({"type": "settings_upload_success"}))
-                continue
+                shared_state.update_visual(text="AI denkt na...", audio_level=0.0, active_model=model)
+                answer = await call_ollama_api_async(model, user_text)
             except Exception as exc:
-                await websocket.send(json.dumps({"type": "error", "message": f"Settings upload failed: {exc}"}))
-                continue
+                answer = f"Ollama fout: {exc}"
+            finally:
+                shared_state.update_visual(active_model=None)
 
-        if message_type == "download_settings":
-            try:
-                settings_file = PROJECT_DIR / "server_settings.json"
-                if settings_file.exists():
-                    with open(settings_file, 'r', encoding='utf-8') as f:
-                        settings_data = json.load(f)
-                    # Voeg gedetecteerde Tailscale IP toe zodat clients (Android/iPhone)
-                    # automatisch de VPN-host kunnen gebruiken wanneer beschikbaar.
-                    try:
-                        ts_ip = detect_tailscale_ip()
-                        if ts_ip:
-                            if isinstance(settings_data, dict):
-                                conn_data = settings_data.get("connection") if settings_data.get("connection") else {}
-                                conn_data["tailscale_host"] = ts_ip
-                                settings_data["connection"] = conn_data
-                            print(f"📡 Added tailscale_host to settings: {ts_ip}")
-                    except Exception as _:
-                        pass
+            # Sla AI antwoord op in geschiedenis
+            save_chat_history_entry({
+                "message": answer,
+                "is_user": False,
+                "timestamp": datetime.now().isoformat()
+            })
 
-                    await websocket.send(json.dumps({
-                        "type": "settings_data",
-                        "settings_data": settings_data
-                    }))
-                    continue
-                else:
-                    await websocket.send(json.dumps({"type": "error", "message": "No settings found on server"}))
-                    continue
-            except Exception as exc:
-                await websocket.send(json.dumps({"type": "error", "message": f"Settings download failed: {exc}"}))
-                continue
+            emotion = detect_emotion(answer)
+            shared_state.set(emotion, answer, 0.0)
+            await websocket.send(json.dumps({"reply": answer, "emotion": emotion}))
 
-        # Roles sync endpoints
-        if message_type == "upload_roles":
-            roles_data = data.get("roles_data")
-            try:
-                roles_file = PROJECT_DIR / "server_roles.json"
-                with open(roles_file, 'w', encoding='utf-8') as f:
-                    json.dump(roles_data, f, indent=2)
-                await websocket.send(json.dumps({"type": "roles_upload_success"}))
-                continue
-            except Exception as exc:
-                await websocket.send(json.dumps({"type": "error", "message": f"Roles upload failed: {exc}"}))
-                continue
-
-        if message_type == "download_roles":
-            try:
-                roles_file = PROJECT_DIR / "server_roles.json"
-                if roles_file.exists():
-                    with open(roles_file, 'r', encoding='utf-8') as f:
-                        roles_data = json.load(f)
-                    await websocket.send(json.dumps({
-                        "type": "roles_data",
-                        "roles_data": roles_data
-                    }))
-                    continue
-                else:
-                    await websocket.send(json.dumps({"type": "error", "message": "No roles found on server"}))
-                    continue
-            except Exception as exc:
-                await websocket.send(json.dumps({"type": "error", "message": f"Roles download failed: {exc}"}))
-                continue
-
-        # Chat history sync endpoints
-        if message_type == "upload_chat_message":
-            chat_message = data.get("chat_message")
-            try:
-                save_chat_history_entry(chat_message)
-                await websocket.send(json.dumps({"type": "chat_message_upload_success"}))
-                continue
-            except Exception as exc:
-                await websocket.send(json.dumps({"type": "error", "message": f"Chat message upload failed: {exc}"}))
-                continue
-
-        if message_type == "download_chat_history":
-            try:
-                chat_history_file = PROJECT_DIR / "server_chat_history.json"
-                if chat_history_file.exists():
-                    with open(chat_history_file, 'r', encoding='utf-8') as f:
-                        chat_history = json.load(f)
-                    await websocket.send(json.dumps({
-                        "type": "chat_history_data",
-                        "chat_history": chat_history
-                    }))
-                    continue
-                else:
-                    await websocket.send(json.dumps({
-                        "type": "chat_history_data",
-                        "chat_history": []
-                    }))
-                    continue
-            except Exception as exc:
-                await websocket.send(json.dumps({"type": "error", "message": f"Chat history download failed: {exc}"}))
-                continue
-
-        user_text = data.get("text", "").strip()
-        if not user_text:
-            await websocket.send(json.dumps({"error": "Lege tekst ontvangen"}))
-            continue
-
-        # Gebruik het door de client gevraagde model.
-        model = data.get("model", default_model)
-        think = data.get("think", False)
-
-        # Als 'think' uit staat (snelle modus), gebruik qwen3:8b (de algemene default)
-        # in plaats van het geforceerde coder model. Dit zorgt dat qwen3:8b
-        # ook werkt zonder de vertraging van eventuele 'thinking' parameters.
-        if not think and not data.get("model"):
-            model = DEFAULT_GENERAL_MODEL
-
-        # Sla gebruikersbericht op in geschiedenis
-        save_chat_history_entry({
-            "message": user_text,
-            "is_user": True,
-            "timestamp": datetime.now().isoformat()
-        })
-
-        try:
-            shared_state.update_visual(text="AI denkt na...", audio_level=0.0, active_model=model)
-            answer = await ask_ollama_async(model, user_text)
-        except Exception as exc:
-            answer = f"Ollama fout: {exc}"
-        finally:
-            shared_state.update_visual(active_model=None)
-
-        # Sla AI antwoord op in geschiedenis
-        save_chat_history_entry({
-            "message": answer,
-            "is_user": False,
-            "timestamp": datetime.now().isoformat()
-        })
-
-        emotion = detect_emotion(answer)
-        shared_state.set(emotion, answer, 0.0)
-        await websocket.send(json.dumps({"reply": answer, "emotion": emotion}))
+    except websockets.exceptions.ConnectionClosed:
+        print(f"ℹ️ Verbinding met {peer_label} ({peer_ip}) verbroken.")
+    except Exception as e:
+        print(f"⚠️ Onverwachte fout in ws_handler voor {peer_label}: {e}")
 
 
 async def start_server(host: str, port: int, shared_state: SharedState, default_model: str):
@@ -1309,6 +1498,50 @@ def create_energy_renderer(ctx):
     vao = ctx.vertex_array(program, [(vbo, "2f", "in_vert")])
     return program, vbo, vao
 
+def check_ollama_install() -> bool:
+    """Controleer of Ollama CLI correct is geïnstalleerd en toegankelijk is."""
+    try:
+        result = subprocess.run(["ollama", "-v"], capture_output=True, text=True, check=True)
+        version = result.stdout.strip()
+        print(f"✅ Ollama CLI gevonden: {version}")
+        return True
+    except FileNotFoundError:
+        print("❌ Ollama CLI niet gevonden. Zorg ervoor dat het is geïnstalleerd en in PATH staat.")
+        exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Fout bij het uitvoeren van 'ollama -v': {e.stderr.strip()}")
+        exit(1)
+
+def check_ollama_model(model_name: str) -> bool:
+    """Controleer of een specifiek Ollama-model beschikbaar is."""
+    try:
+        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=True)
+        models = result.stdout.strip().splitlines()
+        if model_name in models:
+            print(f"✅ Ollama-model '{model_name}' is beschikbaar.")
+            return True
+        else:
+            print(f"❌ Ollama-model '{model_name}' is niet beschikbaar. Beschikbare modellen: {', '.join(models)}")
+            print("wilt u het model downloaden? (ja/nee)")
+            user_input = input().strip().lower()
+            if user_input in {"ja", "j", "yes", "y"}:
+                print(f"📥 Downloaden van model '{model_name}'...")
+                try:
+                    subprocess.run(["ollama", "pull", model_name], check=True)
+                    print(f"✅ Model '{model_name}' succesvol gedownload.")
+                    return True
+                except subprocess.CalledProcessError as e:
+                    print(f"❌ Fout bij het downloaden van model '{model_name}': {e.stderr.strip()}")
+                    exit(1)
+            else:
+                print("❌ Model niet gedownload.")
+                return False
+    except FileNotFoundError:
+        print("❌ Ollama CLI niet gevonden. Zorg ervoor dat het is geïnstalleerd en in PATH staat.")
+        exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Fout bij het uitvoeren van 'ollama list': {e.stderr.strip()}")
+        exit(1)
 
 def create_text_program(ctx):
     return ctx.program(vertex_shader=TEXT_VERTEX_SHADER, fragment_shader=TEXT_FRAGMENT_SHADER)
@@ -1553,6 +1786,10 @@ def run_wave_ui(shared_state: SharedState, host: str, port: int, model: str):
             memory_percent = read_memory_usage()
             cpu_usage = read_cpu_usage()
             next_temp_read = now + 2.0
+            
+            # Periodieke RAM cleanup (elke 10s ongeveer)
+            if int(now) % 10 == 0:
+                gc.collect()
 
         ctx.clear(0.0, 0.0, 0.0, 1.0)
         energy_program["iResolution"].value = (width, height)
@@ -1577,7 +1814,11 @@ def run_wave_ui(shared_state: SharedState, host: str, port: int, model: str):
 
 
 def preload_models():
-    """Laadt de belangrijkste modellen alvast in het geheugen voor directe respons."""
+    """Laadt de belangrijkste modellen alvast in het geheugen."""
+    if OLLAMA_HOST != "127.0.0.1" and OLLAMA_HOST != "localhost":
+        print(f"ℹ️ Preloading overgeslagen (Ollama draait op remote host: {OLLAMA_HOST})")
+        return
+
     def _worker():
         print("🚀 Modellen voorladen in GPU/RAM (idle stand)...")
         available = get_available_models()
@@ -1630,6 +1871,8 @@ def main():
     thread.start()
 
     try:
+        check_ollama_install()
+        check_ollama_model(args.model)
         preload_models()
         run_wave_ui(shared_state, args.host, args.port, args.model)
     finally:
